@@ -1,0 +1,30 @@
+# Keep the engine and wrapper DuckDB gitlinks on the same revision.
+[submodule "duckdb"]
+	path = duckdb
+	url = https://github.com/duckdb/duckdb.git
+	branch = v2.0-cyanoptera
+	ignore = dirty
+[submodule "substrait"]
+	path = substrait
+	url = https://github.com/sirius-db/duckdb-substrait-extension.git
+	branch = v2
+[submodule "sirius-duckdb/vcpkg"]
+	path = sirius-duckdb/vcpkg
+	url = https://github.com/Microsoft/vcpkg.git
+[submodule "starrocks/starrocks"]
+	path = experimental/starrocks/starrocks
+	url = https://github.com/starrocks/starrocks
+[submodule "starrocks/brpc"]
+	path = experimental/starrocks/brpc
+	url = https://github.com/apache/brpc
+[submodule "experimental/doris/doris"]
+	path = experimental/doris/doris
+	url = https://github.com/apache/doris
+	shallow = true
+[submodule "sirius-duckdb/duckdb"]
+	path = sirius-duckdb/duckdb
+	url = https://github.com/duckdb/duckdb.git
+	branch = v2.0-cyanoptera
+[submodule "sirius-duckdb/extension-ci-tools"]
+	path = sirius-duckdb/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools.git

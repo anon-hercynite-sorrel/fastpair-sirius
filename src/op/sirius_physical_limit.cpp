@@ -1,0 +1,146 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/sirius_physical_limit.hpp"
+
+#include "data/data_batch_utils.hpp"
+#include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
+
+#include <cudf/copying.hpp>
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+
+namespace sirius {
+namespace op {
+
+sirius_physical_streaming_limit::sirius_physical_streaming_limit(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::BoundLimitNode limit_val_p,
+  duckdb::BoundLimitNode offset_val_p,
+  std::size_t estimated_cardinality,
+  bool parallel)
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::STREAMING_LIMIT, std::move(types), estimated_cardinality),
+    limit_val(std::move(limit_val_p)),
+    offset_val(std::move(offset_val_p)),
+    parallel(parallel),
+    _remaining_offset(0),
+    _remaining_limit(0)
+{
+  if (limit_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+    _remaining_limit.store(static_cast<int64_t>(limit_val.GetConstantValue()),
+                           std::memory_order_relaxed);
+  }
+  if (offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+    _remaining_offset.store(static_cast<int64_t>(offset_val.GetConstantValue()),
+                            std::memory_order_relaxed);
+  }
+}
+
+int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, int64_t max_claim)
+{
+  int64_t current = counter.load(std::memory_order_acquire);
+  while (current > 0) {
+    int64_t to_claim = std::min(current, max_claim);
+    if (counter.compare_exchange_weak(current, current - to_claim, std::memory_order_acq_rel)) {
+      return to_claim;
+    }
+    current = counter.load(std::memory_order_acquire);
+  }
+  return 0;
+}
+
+std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
+
+  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
+    throw not_implemented_exception("Streaming limit with non-constant limit value");
+  }
+  if (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
+      offset_val.Type() != duckdb::LimitNodeType::UNSET) {
+    throw not_implemented_exception("Streaming limit with non-constant offset value");
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(input_batches.size());
+
+  for (auto const& batch : input_batches) {
+    // Check if limit is already exhausted
+    if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
+
+    auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto num_rows = static_cast<int64_t>(view.num_rows());
+
+    if (num_rows == 0) { continue; }
+
+    // Atomically claim offset rows to skip from this batch
+    auto skip      = claim(_remaining_offset, num_rows);
+    auto available = num_rows - skip;
+    if (available <= 0) { continue; }
+
+    // Atomically claim limit rows to produce from available rows
+    auto take = claim(_remaining_limit, available);
+    if (take <= 0) { continue; }
+
+    auto start  = static_cast<cudf::size_type>(skip);
+    auto end    = static_cast<cudf::size_type>(skip + take);
+    auto slices = cudf::slice(view, {start, end}, stream);
+    if (slices.empty()) { continue; }
+
+    // cudf::slice returns a vector of table_views; materialize into a table
+    auto sliced_table = std::make_unique<cudf::table>(
+      slices.front(), stream, batch.get_memory_space()->get_default_allocator());
+    std::unique_ptr<cucascade::idata_representation> output_data =
+      std::make_unique<cucascade::gpu_table_representation>(
+        std::move(sliced_table), *batch.get_memory_space(), stream);
+
+    auto const batch_id = ::sirius::get_next_batch_id();
+    auto output_batch   = cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+    output_batches.push_back(std::move(output_batch));
+  }
+
+  // Emit a 0-row batch when nothing passed, as scans and filters do for an empty input, so
+  // downstream operators still see the input. An ungrouped aggregate needs it to return its row.
+  if (output_batches.empty() && !input_batches.empty()) {
+    auto const& batch = input_batches.front();
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    std::unique_ptr<cucascade::idata_representation> output_data =
+      std::make_unique<cucascade::gpu_table_representation>(
+        cudf::empty_like(view), *batch.get_memory_space(), stream);
+    auto const batch_id = ::sirius::get_next_batch_id();
+    output_batches.push_back(cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
+  }
+
+  if (_remaining_limit.load(std::memory_order_acquire) <= 0) {
+    _limit_exhausted.store(true, std::memory_order_release);
+  }
+
+  return std::make_unique<pipelineable_operator_data>(output_batches);
+}
+
+}  // namespace op
+}  // namespace sirius

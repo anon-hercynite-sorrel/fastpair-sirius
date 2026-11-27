@@ -1,0 +1,28 @@
+target_sources(
+  sirius_objects
+  PRIVATE date_cast.cu
+          decimal_integer_cast.cu
+          dense_count_join_impl.cu
+          sorted_keys.cu
+          low_cardinality_groupby.cu
+          device_copy_batch.cpp
+          device_transfer.cpp
+          dynamic_filter_mask_ops.cu
+          dynamic_filter_replica_transfer.cu
+          sirius_dynamic_bloom_filter.cu
+          sirius_dynamic_in_list_filter.cu
+          sirius_dynamic_small_in_list_filter.cu
+          sirius_like_multiliteral.cu
+          sirius_round_floating_point.cu
+          scan/gpu_decode_alp.cu
+          scan/gpu_decode_bitpacking.cu
+          scan/gpu_decode_rle.cu
+          scan/gpu_decode_strings.cu
+          scan/gpu_native_decode.cu
+          scan/strings/dict_fsst.cu
+          scan/strings/dictionary.cu
+          scan/strings/fsst.cu
+          scan/strings/uncompressed.cu
+          vss/cudf_raft_interop.cu
+          vss/brute_force_search.cu
+          vss/ivf_flat_index.cu)

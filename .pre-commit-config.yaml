@@ -1,0 +1,102 @@
+# To use:
+#
+#     pre-commit run -a
+#
+# Or:
+#
+#     pre-commit install  # (runs every time you commit in git)
+#
+# To update this file:
+#
+#     pre-commit autoupdate
+#
+# See https://github.com/pre-commit/pre-commit
+
+# Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
+# .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
+# strip the leading context space on blank lines and corrupt `git apply`.
+# Paimon warehouse files are verbatim writer output, checked by corpus hashes.
+exclude: \.csv$|\.patch$|^experimental/.*|^src/include/third_party/.*|^test/cpp/integration/data/paimon_conformance/warehouse/
+
+repos:
+  # Standard hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        # Vendored TPC-H / TPC-DS test databases live here and are intentionally large.
+        exclude: 'test/cpp/integration/data/duckdb/.*\.duckdb'
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+        # These tracked links target the optional .claude/claude-tools submodule,
+        # which lint CI intentionally leaves uninitialized.
+        exclude: '^\.claude/(commands/(commit-push-pr|review)\.md|skills/skill-creator)$'
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: |
+          (?x)^(
+            ^python/cudf/cudf/tests/data/vocab.txt|
+            .*version-hint\.text$|
+            ^test/cpp/integration/data/iceberg_conformance/.*\.json$
+          )
+      - id: mixed-line-ending
+      - id: pretty-format-json
+        args: [--autofix]
+        # The iceberg conformance corpus is verbatim pyiceberg output, and that is the whole
+        # point of it: the expectations are Apache's, not ours. --autofix re-indents AND sorts
+        # keys, so formatting it would leave the in-tree copy differing from what gen_corpus.py
+        # writes — every regeneration would fail lint, and every lint fix would move the corpus
+        # further from the reference implementation. check-json still validates these files.
+        exclude: '^test/cpp/integration/data/iceberg_conformance/.*\.json$'
+      - id: trailing-whitespace
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+  - repo: https://github.com/sirosen/texthooks
+    rev: 0.7.1
+    hooks:
+      - id: fix-smartquotes
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.4
+    hooks:
+      - id: clang-format
+        types_or: [c++, c, cuda]
+        args: ["-fallback-style=none", "-style=file", "-i"]
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args:
+          [
+            "--write-changes",
+            "--ignore-words=.codespell_words",
+            '--skip="*.eps"',
+          ]
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+      - id: cmake-lint
+        args:
+          [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
+  - repo: local
+    hooks:
+      - id: rumdl
+        name: rumdl check --fix
+        entry: pixi run --locked rumdl check --fix
+        language: system
+        types: [markdown]
+        require_serial: true
+      - id: check-orphan-tests
+        name: check for orphaned test files
+        entry: python3 scripts/check_orphan_tests.py
+        language: system
+        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|cmake/sirius-.*\.cmake|test/cpp/orphan_test_allowlist\.txt)$
+        pass_filenames: false

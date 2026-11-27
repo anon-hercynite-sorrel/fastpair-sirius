@@ -1,0 +1,199 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/scan/decoded_batch_representation.hpp"
+#include "op/scan/owning_table_view.hpp"
+
+#include <data/data_batch_utils.hpp>
+#include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/host_keep_mask.hpp>
+#include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <sirius/exception.hpp>
+
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace sirius::op::scan {
+
+namespace {
+
+// A decode that omitted its trailing pure-filter columns is only servable when it also applied the
+// scan's whole filter and kept exactly the columns the output reads, or a proven count-only
+// carrier; anything else would hand post_filter_and_project a layout it does not index.
+void require_dropped_layout(gpu_ingestible const& ingestible,
+                            scan_operator_input const& split,
+                            cudf::size_type served_width)
+{
+  if (!split.pushdown_filter_only_columns_dropped) { return; }
+  if (!split.pushdown_row_filtered) {
+    throw sirius::internal_exception(
+      "[gpu_ingestible::materialize_table] the decode dropped filter-only columns without applying "
+      "the scan's whole filter");
+  }
+  if (split.pushdown_row_count_carrier) {
+    if (!ingestible.allows_row_count_carrier() || served_width != 1)
+      throw sirius::internal_exception("invalid count-only decode carrier layout");
+    return;
+  }
+  auto const prefix = ingestible.output_prefix_width();
+  if (!prefix || static_cast<std::size_t>(served_width) != *prefix) {
+    throw sirius::internal_exception(
+      "[gpu_ingestible::materialize_table] a batch without its filter-only columns has {} "
+      "column(s), but the output reads {}",
+      served_width,
+      prefix ? std::to_string(*prefix) : std::string{"an unknown number"});
+  }
+}
+
+}  // namespace
+
+void gpu_ingestible::attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>)
+{
+  throw std::logic_error("scan does not support preparation ledger installation");
+}
+
+std::vector<gpu_ingestible::preparation_source> gpu_ingestible::make_preparation_sources(
+  io::ioctx_resolver resolve)
+{
+  std::vector<preparation_source> sources;
+  sources.push_back(make_preparation_source(std::move(resolve)));
+  return sources;
+}
+
+gpu_ingestible::preparation_source gpu_ingestible::make_preparation_source(
+  io::ioctx_resolver resolve)
+{
+  preparation_source source;
+  source.try_claim   = [this, resolve = std::move(resolve)] { return try_claim_split(resolve); };
+  source.bind_wakeup = [this](scan_manager::preparation_wakeup wake) {
+    bind_preparation_wakeup(std::move(wake));
+  };
+  return source;
+}
+
+std::optional<owning_table_view> gpu_ingestible::project_borrowed_strings(
+  filtered_table& input) const
+{
+  if (!input.borrows_string_channels || has_row_filter() ||
+      input.state != filter_state::UNFILTERED) {
+    return std::nullopt;
+  }
+  auto layout = view_layout(input, {});
+  if (!layout || layout->residual) { return std::nullopt; }
+  // The cached layout already describes repeats and reordering without synthesized columns.
+  // Selecting a table_view permits repeats while keeping every buffer under the original lease.
+  auto projected = input.table.view().select(layout->projected_columns);
+  return owning_table_view{std::make_shared<owning_table_view>(std::move(input.table)), projected};
+}
+
+filtered_table gpu_ingestible::materialize_table(
+  const op::scan::scan_operator_input& split,
+  ::cuda::stream_ref stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
+{
+  auto* mem_space = split.gpu_memory_space;
+  if (split.has_scan_metadata()) [[likely]] {
+    split.update(io::cache::scan_stage::reading);
+    auto materialized = materialize_metadata_to_table(
+      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
+    if (split.mvcc_keep_mask.has_mask()) {
+      // Only insert-delta splits carry a visibility mask here; disk-walk
+      // splits never do. Sync before returning for the same reason as the
+      // cached branch below.
+      auto const& mask = split.mvcc_keep_mask;
+      auto view        = materialized.table.view();
+      if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {
+        throw std::runtime_error("[gpu_ingestible::materialize_table] mvcc keep-mask covers " +
+                                 std::to_string(mask.row_count) +
+                                 " rows but the materialized split has " +
+                                 std::to_string(view.num_rows()));
+      }
+      auto masked = apply_host_keep_bitmask(
+        view, mask.view(), mask.row_count, stream, mem_space->get_default_allocator());
+      stream.sync();
+      return {.table = owning_table_view{std::move(masked)}, .state = materialized.state};
+    }
+    return materialized;
+  } else {
+    // A decode-row-filtered batch already had the split's whole table-filter
+    // conjunction applied during decompression: rows are compacted to the
+    // survivors, but the batch still carries the materialized column order.
+    // ROW_FILTERED makes post_filter_and_project skip filter evaluation while
+    // still assembling the projection/output layout.
+    auto const decoded_state =
+      split.pushdown_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
+    if (split.stolen_table) {
+      require_dropped_layout(*this, split, split.stolen_table->num_columns());
+      // prepare_for_processing took ownership of the wrapper batch's per-query
+      // table; move it straight into the scan output — the owned-table
+      // owning_table_view releases by moving columns, so no copy is made.
+      split.stolen_table_consumed = true;
+      return {.table                 = owning_table_view{std::move(split.stolen_table)},
+              .state                 = decoded_state,
+              .predicate_columns     = split.pushdown_predicate_columns,
+              .predicates_enforced   = split.pushdown_predicates_enforced,
+              .enforced_like_columns = split.pushdown_enforced_like_columns};
+    }
+    if (split.stolen_table_consumed) {
+      throw std::runtime_error(
+        "[gpu_ingestible::materialize_table] the split's stolen table was already consumed; "
+        "refusing to re-materialize from the emptied wrapper batch");
+    }
+    auto batch  = split.get_cached_batch();
+    auto rbatch = batch->to_read_only();
+    auto view   = get_cudf_table_view(rbatch);
+    require_dropped_layout(*this, split, view.num_columns());
+    if (split.mvcc_keep_mask.has_mask()) {
+      // prepare_for_processing already refuses the decode-filtered + keep-mask
+      // combination, and the row-count check below catches any slip: a
+      // compacted table can no longer line up with the positional mask.
+      auto const& mask = split.mvcc_keep_mask;
+      if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {
+        throw std::runtime_error("[gpu_ingestible::materialize_table] mvcc keep-mask covers " +
+                                 std::to_string(mask.row_count) +
+                                 " rows but the cached chunk has " +
+                                 std::to_string(view.num_rows()));
+      }
+      auto masked = apply_host_keep_bitmask(
+        view, mask.view(), mask.row_count, stream, mem_space->get_default_allocator());
+      // The pinned mask words feed a true-async H2D DMA, and for a HOST-tier
+      // chunk `rbatch` owns the staged device copy the filter kernel reads —
+      // neither release is ordered against the stream once this branch
+      // returns. Await the mask work before dropping them, the same
+      // discipline the duckdb-native decoder uses for its staging buffers
+      // (submit_and_await).
+      stream.sync();
+      return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
+    }
+    auto const stored_bytes = rbatch.get_data()->get_size_in_bytes();
+    auto const borrows_strings = dynamic_cast<sirius::borrowed_string_batch_representation const*>(
+                                   rbatch.get_data()) != nullptr;
+    return {.table                   = owning_table_view{std::move(rbatch), view},
+            .state                   = decoded_state,
+            .predicate_columns       = split.pushdown_predicate_columns,
+            .predicates_enforced     = split.pushdown_predicates_enforced,
+            .enforced_like_columns   = split.pushdown_enforced_like_columns,
+            .stored_bytes            = stored_bytes,
+            .borrows_string_channels = borrows_strings};
+  }
+}
+
+}  // namespace sirius::op::scan

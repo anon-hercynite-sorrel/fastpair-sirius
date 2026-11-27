@@ -1,0 +1,19 @@
+[package]
+name = "onpair-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C ABI over the onpair crate for Simpatico's onpair operator (host-side training and encoding; CPU reference decode for tests)."
+publish = false
+
+[lib]
+name = "onpair_bridge"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+onpair = "=0.3.0"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 1

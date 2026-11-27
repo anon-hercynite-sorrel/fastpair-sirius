@@ -1,0 +1,7 @@
+@INCLUDE              = docs/Doxyfile.common
+PROJECT_BRIEF         = "GPU-native analytics · C++ API reference"
+OUTPUT_DIRECTORY      = build/docs
+INPUT                 = include/sirius docs/api/index.md
+EXCLUDE               = include/sirius/ffi.hpp
+USE_MDFILE_AS_MAINPAGE = docs/api/index.md
+PREDEFINED            = SIRIUS_EXPORT= "__attribute__(x)="

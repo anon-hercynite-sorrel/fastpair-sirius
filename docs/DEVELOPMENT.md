@@ -1,0 +1,219 @@
+# Developing Sirius
+
+The root CMake project builds the Sirius library and its C++ tests.
+The separate `sirius-duckdb/` project builds the DuckDB extension against the
+installed library. We use `CMakePresets.json` for the engine build configuration
+and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
+
+## Public API documentation
+
+Build the C reference for `include/sirius-c/`, the C++ reference for `include/sirius/`,
+and the Rust `sirius` and `sirius-sys` crate references:
+
+```bash
+pixi run -e docs docs
+```
+
+Open `build/docs/site/index.html` in your browser. The site has a landing page at
+`/`, the C reference at `/c/`, the C++ reference at `/cpp/`, and the Rust references at `/rust/`. These paths are relative to the GitHub Pages project URL.
+
+Build individual references with `pixi run -e docs docs-c`,
+`pixi run -e docs docs-cpp`, or
+`pixi run -e docs docs-rust`.
+
+The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
+Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
+submodules. The public Rust references require no C++ compilation. The Rust
+task sets `DOCS_RS=1` to skip Sirius's native build and link steps, and treats
+Rustdoc warnings as errors. All builds run directly through Pixi tasks, with no
+Python or helper script.
+
+The landing page and C/C++ theme follow the system light/dark preference; the Rust
+reference uses Rustdoc's built-in themes. Doxygen configuration and styling live
+in `docs/Doxyfile.common`, `docs/api/`, and `docs/c/`, and the landing page lives in `docs/site/`. Generated output stays
+under `build/docs/`. The `docs` task assembles all three references into a fresh
+`build/docs/site/` directory for publication.
+
+The `docs-theme` dependency task downloads [Doxygen Awesome](https://github.com/jothepro/doxygen-awesome-css)
+v2.5.0 at commit `46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da`, verifies the archive's
+SHA-256 checksum, and caches its CSS and MIT license under
+`build/docs/theme/`. The first build needs network access and `tar`; subsequent
+builds reuse the cached assets. The license is included in the generated site.
+To upgrade the theme, update the commit, version, and checksum in `pixi.toml`,
+then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
+
+The **Docs** workflow builds all three references on pull requests and merge-queue
+entries, uploading the combined site as one `github-pages` artifact. Pushes to
+`main` build and deploy the site; deployment runs only for those pushes.
+For the first deployment, set **Settings → Pages → Build and deployment → Source**
+to **GitHub Actions**, and allow `main` in the `github-pages` environment's deployment
+rules. The published URL appears on the deployment job.
+
+## Building Sirius
+
+Clone the repository with all submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+```
+
+Build with Pixi (uses all available cores). The default builds Sirius, its C++ tests,
+and the shared DuckDB extension in GCC Release mode:
+
+```bash
+pixi run make                        # Sirius and DuckDB extension (GCC Release)
+pixi run make release                # Sirius and C++ tests only
+pixi run make clang-relwithdebinfo   # Clang RelWithDebInfo
+pixi run make clang-debug            # Clang Debug
+```
+
+If the build exhausts memory, reduce parallelism:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
+```
+
+The extension can also be built separately using [its Makefile](../sirius-duckdb/README.md).
+
+Start the built DuckDB shell with Sirius loaded:
+
+```bash
+pixi run duckdb
+```
+
+Alternatively, load the extension into an existing DuckDB shell:
+
+```sql
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
+```
+
+## Pre-commit
+
+Sirius uses [pre-commit](https://pre-commit.com/) hooks to enforce formatting and linting. Install the hooks after cloning so every commit is checked automatically:
+
+```bash
+pixi run pre-commit install
+```
+
+To run all hooks manually across the whole tree:
+
+```bash
+pixi run pre-commit run -a
+```
+
+## Testing
+
+Run the full C++ unit test suite (what CI runs):
+
+```bash
+pixi run make test
+```
+
+Run tests by Catch2 tag or name:
+
+```bash
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
+pixi run build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
+```
+
+## Using CLion for development
+
+CLion does not natively support pixi environments. One way to circumvent that is to create a custom
+toolchain for sirius and load the pixi environment via an environment file. This allows a consistent use of CLion, both
+when using natively on a system, or via the remote development workflow. To support this, the `clion-env` task creates a
+`sirius_pixi_env_for_clion.sh` file inside the `build` directory (ignored by default).
+
+### First time setup
+
+- Run `pixi run clion-env`. This will generate/update the `sirius_pixi_env_for_clion.sh`.
+- Choose correct `CMakeLists.txt`:
+    - Open the sirius directory in CLion. CLion will ask how load the project, as a `Makefile` project or a `CMake`
+      project, choose `CMake`.
+    - Choosing `CMake` project will fail with configure errors, because as detailed earlier, the actual CMake source of
+      the project is the `duckdb` submodule dir, but CLion assumes the root `CMakeLists.txt` to be the source.
+    - To fix, go to `Tools > CMake > Unload CMake Project`, then open any cpp file in the sirius src dir, a banner will
+      showup: `This file does not belong to any project target` with a `Fix` button to the right.
+    - Click `Fix` and select `Choose CMakeLists.txt`, and navigate to the `duckdb` subdir and choose its
+      `CMakeLists.txt`.
+- Add sirius-specific toolchain:
+    - Open settings, under `Build, Execution, Deployment > Toolchains` click the `+` button to add a new toolchain. Name
+      it something like `Sirius` for easy differentiation.
+    - In the upper right corner there should be a link named `Add Environment`. Click it and choose `From File`.
+    - Navigate to and select the `sirius_pixi_env_for_clion.sh` inside the build directory.
+    - Verify the toolchain has properly inherited the pixi env. Open settings, under
+      `Build, Execution, Deployment > Toolchains > Sirius`, the `C Compiler` and `C++ Compiler` should have detected
+      the pixi env compilers which can be verified by hovering over the `Detected ...` box.
+    - Goto `Build, Execution, Deployment > CMake`, this should have a set to presets already loaded. Duplicate and
+      enable the ones you need and make them use the `Sirius` toolchain that has the pixi compilers. We need to
+      duplicate the preset profiles to make the use our custom toolchain, as they use the `Default` toolchain by
+      default.
+- Click `Apply` to save the changes. CLion should now properly configure the project, allowing you to build and debug.
+
+### Alternate setup using CLion
+
+An alternate way to use CLion with the pixi-provided tools (compilers, CMake, ninja, etc.) is
+to launch CLion from a shell where the pixi environment is already active, so
+that the CLion process inherits the correct `PATH` and environment variables. This works best when one is only using
+CLion natively on a machine directly, and not via remote connections.
+
+#### Launching CLion within the pixi environment
+
+Quit all existing CLion instances (more on that below), then inside the
+sirius root dir
+
+```bash
+pixi shell
+/path/to/clion.sh .
+```
+
+Where `/path/to/clion.sh` is the **real** CLion launcher, not the JetBrains
+Toolbox wrapper (again, more info below). For a typical Toolbox install
+on Linux this is along the lines of:
+
+```
+~/.local/share/JetBrains/Toolbox/apps/clion/ch-0/<version>/bin/clion.sh
+```
+
+You can add a shell function to your `~/.bashrc` (or equivalent) for
+convenience:
+
+```bash
+real_clion() {
+    /path/to/clion.sh "$@"
+}
+```
+
+Then the workflow simply becomes:
+
+```bash
+pixi shell
+real_clion .
+```
+
+In this case, the Default toolchain can be used as it -- verify it has properly inherited the pixi env: Open settings,
+under `Build, Execution, Deployment > Toolchains > Default`, the `C Compiler` and `C++ Compiler` should have detected
+the pixi env compilers which can be verified by hovering over the `Detected ...` box.
+
+### Gotchas
+
+1. **Toolbox wrapper does not pass your environment.**
+   If CLion was installed via JetBrains Toolbox, the `clion` command on your
+   `PATH` is a small wrapper script that talks to the Toolbox App over IPC.
+   The Toolbox App then spawns CLion as its own child, so the environment from
+   your shell is **not** inherited. Always use the real `clion.sh` launcher
+   instead.
+
+2. **An already-running CLion instance will absorb new projects.**
+   When `clion.sh` detects a running CLion instance, it hands the "open
+   project" request to that existing process (via IPC) and exits. The project
+   opens in a new window, but it runs under the environment of the **original**
+   CLion process. If you need the pixi environment, **quit CLion entirely**
+   before relaunching from `pixi shell`.
+
+3. **The direnv plugin is unreliable.**
+   The third-party direnv plugins for JetBrains IDEs
+   (`intellij-direnv`, `Better Direnv`) have open compatibility issues with
+   recent IDE versions (2024.2+) and appear to be infrequently maintained.
+   Launching CLion from an activated pixi shell is more dependable than relying
+   on a direnv plugin.

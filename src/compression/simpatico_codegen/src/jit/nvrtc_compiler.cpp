@@ -1,0 +1,259 @@
+#include "codegen/jit/nvrtc_compiler.hpp"
+
+#include "codegen/util/cuda_check.hpp"
+#include "compilation_request.hpp"
+
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+
+#include <nvrtc.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+// The headers the rendered kernels #include are baked into the binary as named
+// in-memory headers and fed to NVRTC at compile time, so the JIT needs no
+// header tree on disk:
+//   - project headers (codegen/decode/rle_block.cuh, codegen/stdint_shim.hpp),
+//     embedded by cmake/embed_jit_headers.cmake
+//   - the complete CCCL library bundle, embedded by
+//     cmake/embed_cccl_headers.cmake
+// This lets a binary distribution JIT-compile with only the driver and the
+// nvrtc runtime the extension already links -- no CUDA toolkit headers on disk.
+#include "codegen/jit/cccl_embedded_headers.h"
+#include "codegen/jit/embedded_headers.h"
+
+namespace codegen::jit {
+
+int arch_cc_for_current_device()
+{
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess)
+    throw std::runtime_error("arch_cc_for_current_device: cudaGetDevice failed");
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
+    throw std::runtime_error("arch_cc_for_current_device: cudaGetDeviceProperties failed");
+  return prop.major * 10 + prop.minor;
+}
+
+namespace {
+
+[[noreturn]] void throw_nvrtc(const char* api, nvrtcResult r)
+{
+  std::string msg = "nvrtc ";
+  msg += api;
+  msg += " failed: ";
+  msg += nvrtcGetErrorString(r);
+  throw std::runtime_error(msg);
+}
+
+#define NVRTC_OR_THROW(call)                         \
+  do {                                               \
+    nvrtcResult _r = (call);                         \
+    if (_r != NVRTC_SUCCESS) throw_nvrtc(#call, _r); \
+  } while (0)
+
+}  // namespace
+
+const detail::Digest& detail::cache_environment()
+{
+  static const Digest identity = [] {
+    int major = 0, minor = 0;
+    NVRTC_OR_THROW(nvrtcVersion(&major, &minor));
+    // Both linkage modes use the reported version. Same-version compiler
+    // patches intentionally retain reuse; header contents have their own digests.
+    return environment_identity({kEmbeddedJitHeadersIdentity,
+                                 kCcclEmbeddedHeadersIdentity,
+                                 static_cast<uint32_t>(major),
+                                 static_cast<uint32_t>(minor)});
+  }();
+  return identity;
+}
+
+CUfunction CompiledKernel::func_for_current_device() const
+{
+  if (!kern) return nullptr;
+
+  // cuKernelGetFunction binds the kernel to the calling thread's current context,
+  // and cuLaunchKernel rejects the result from any other context
+  // (CUDA_ERROR_INVALID_HANDLE). Threads on one device can hold different
+  // contexts, so a device-keyed cache would hand every thread but the first a
+  // function it cannot launch.
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return nullptr;
+  if (ctx == nullptr) {
+    // A thread that never touched the runtime has no context; make the current
+    // device's primary context current instead of deriving against none.
+    cudaFree(nullptr);
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr) return nullptr;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(func_mu_);
+    auto it = func_per_ctx_.find(ctx);
+    if (it != func_per_ctx_.end()) return it->second;
+  }
+
+  CUfunction fn = nullptr;
+  if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
+
+  std::lock_guard<std::mutex> lock(func_mu_);
+  func_per_ctx_[ctx] = fn;
+  return fn;
+}
+
+CompiledKernel::~CompiledKernel()
+{
+  if (library) {
+    cuLibraryUnload(library);
+    library = nullptr;
+    kern    = nullptr;
+  }
+}
+
+CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
+  : library(other.library),
+    kern(other.kern),
+    cubin(std::move(other.cubin)),
+    rendered_source(std::move(other.rendered_source))
+{
+  func_per_ctx_ = std::move(other.func_per_ctx_);
+  other.library = nullptr;
+  other.kern    = nullptr;
+}
+
+CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
+{
+  if (this != &other) {
+    if (library) cuLibraryUnload(library);
+    library         = other.library;
+    kern            = other.kern;
+    cubin           = std::move(other.cubin);
+    rendered_source = std::move(other.rendered_source);
+    func_per_ctx_   = std::move(other.func_per_ctx_);
+    other.library   = nullptr;
+    other.kern      = nullptr;
+  }
+  return *this;
+}
+
+CompiledKernel compile_plain_kernel(const std::string& source,
+                                    const std::string& entry_symbol,
+                                    const CompileOptions& opts)
+{
+  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+}
+
+CompiledKernel detail::compile_request(const CompilationRequest& request)
+{
+  const auto& source       = request.source;
+  const auto& entry_symbol = request.entry;
+  if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
+  if (entry_symbol.empty()) {
+    throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
+  }
+
+  // All headers the rendered kernels #include are supplied to NVRTC as named
+  // in-memory headers (embedded in the binary): the project headers plus the
+  // complete CCCL bundle. So no header tree is needed
+  // on disk at runtime. The include NAMES must match the `#include` strings
+  // seen by NVRTC (the renderers' `"codegen/..."` and CCCL's `<...>`).
+  std::vector<const char*> hdr_sources;
+  std::vector<const char*> hdr_names;
+  hdr_sources.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+  hdr_names.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+  for (int i = 0; i < kEmbeddedJitHeaderCount; ++i) {
+    hdr_sources.push_back(kEmbeddedJitHeaders[i].source);
+    hdr_names.push_back(kEmbeddedJitHeaders[i].name);
+  }
+  for (int i = 0; i < kCcclEmbeddedHeaderCount; ++i) {
+    hdr_sources.push_back(kCcclEmbeddedHeaders[i].source);
+    hdr_names.push_back(kCcclEmbeddedHeaders[i].name);
+  }
+
+  nvrtcProgram prog = nullptr;
+  NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
+                                    source.c_str(),
+                                    CompilationRequest::program_name,
+                                    static_cast<int>(hdr_names.size()),
+                                    hdr_sources.data(),
+                                    hdr_names.data()));
+
+  nvrtcResult compile_result =
+    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
+
+  // Capture the log unconditionally so warnings on success and errors
+  // on failure surface to callers symmetrically.
+  std::size_t log_size = 0;
+  NVRTC_OR_THROW(nvrtcGetProgramLogSize(prog, &log_size));
+  std::string log;
+  if (log_size > 0) {
+    log.resize(log_size);
+    NVRTC_OR_THROW(nvrtcGetProgramLog(prog, log.data()));
+    if (!log.empty() && log.back() == '\0') log.pop_back();
+  }
+
+  if (compile_result != NVRTC_SUCCESS) {
+    std::string what =
+      std::string("nvrtcCompileProgram failed: ") + nvrtcGetErrorString(compile_result);
+    nvrtcDestroyProgram(&prog);
+    throw CompileError(std::move(what), std::move(log), source);
+  }
+
+  // nvrtc emits PTX/SASS directly into the cubin stream.
+  std::size_t cubin_size = 0;
+  NVRTC_OR_THROW(nvrtcGetCUBINSize(prog, &cubin_size));
+  if (cubin_size == 0) {
+    nvrtcDestroyProgram(&prog);
+    throw CompileError("nvrtc produced empty cubin", std::move(log), source);
+  }
+  std::vector<char> cubin(cubin_size);
+  NVRTC_OR_THROW(nvrtcGetCUBIN(prog, cubin.data()));
+  NVRTC_OR_THROW(nvrtcDestroyProgram(&prog));
+
+  if (const char* dump = std::getenv("CODEGEN_JIT_DUMP_CUBIN")) {
+    FILE* fp = std::fopen(dump, "wb");
+    if (fp) {
+      std::fwrite(cubin.data(), 1, cubin.size(), fp);
+      std::fclose(fp);
+      std::fprintf(stderr, "[codegen_jit] dumped %zu byte cubin to %s\n", cubin.size(), dump);
+    }
+  }
+
+  return load_kernel_from_cubin(std::move(cubin), entry_symbol, source);
+}
+
+CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
+                                      const std::string& entry_symbol,
+                                      std::string rendered_source)
+{
+  if (cubin.empty()) { throw std::runtime_error("load_kernel_from_cubin: empty cubin"); }
+
+  // cuLibraryLoadData is multi-device and does not require a specific context.
+  // cuLibraryGetKernel returns a device-independent CUkernel handle; the
+  // per-device CUfunction is derived lazily via func_for_current_device().
+  CUlibrary lib = nullptr;
+  simpatico::throw_if_cu_error(
+    cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
+    "cuLibraryLoadData");
+
+  CUkernel kern = nullptr;
+  CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
+  if (r != CUDA_SUCCESS) {
+    cuLibraryUnload(lib);
+    simpatico::throw_if_cu_error(r, "cuLibraryGetKernel");
+  }
+
+  CompiledKernel out;
+  out.library         = lib;
+  out.kern            = kern;
+  out.cubin           = std::move(cubin);
+  out.rendered_source = std::move(rendered_source);
+  return out;
+}
+
+}  // namespace codegen::jit

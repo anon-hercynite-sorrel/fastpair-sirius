@@ -1,0 +1,22 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.25
+    host:
+      capacity_bytes: 160000000
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000
+      downgrade_root_dirs: "/tmp/sirius_disk_memory"
+  executor:
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+    scan_manager:
+      # One reactor keeps uring pinned staging at 64 MiB so it fits this
+      # deliberately small host pool; the production default is 4.
+      uring_n_reactors: 1

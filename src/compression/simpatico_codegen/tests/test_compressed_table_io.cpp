@@ -1,0 +1,1343 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Tests for write_compressed_table / read_compressed_table (.hpln v16).
+//
+// Each test_* function throws std::runtime_error on failure; main() catches and
+// reports.  Tests are intentionally independent so a failure in one does not
+// mask others.
+
+#include "api/compressed_leaf_slab.hpp"
+#include "api/compressed_table_io.hpp"
+#include "api/simpatico_codegen.hpp"
+#include "codegen/plan/leaf_desc.hpp"
+#include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/representation.hpp"
+#include "codegen/plan/validity.hpp"
+#include "test_utils.hpp"
+#include "util/host_observation.hpp"
+
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/error.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+
+#include <cuda/stream>
+
+#include <nvcomp/version.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+// RAII temp file: created on construction, deleted on destruction.
+struct TmpFile {
+  std::string path;
+  TmpFile()
+  {
+    char buf[] = "/tmp/simpatico_io_test_XXXXXX";
+    int fd     = mkstemp(buf);
+    if (fd != -1) ::close(fd);
+    path = std::string(buf) + ".hpln";
+  }
+  ~TmpFile() { std::remove(path.c_str()); }
+};
+
+// Flatten leaf kinds from describe() into a simple vector for comparison.
+std::vector<simpatico::OpId> leaf_kinds(simpatico::compressed_table const& ct)
+{
+  std::vector<simpatico::OpId> out;
+  for (auto const& descs : ct.describe())
+    for (auto const& ld : descs)
+      out.push_back(ld.kind);
+  return out;
+}
+
+// Flatten buffer names from describe() into a simple vector for comparison.
+std::vector<std::string> buf_names(simpatico::compressed_table const& ct)
+{
+  std::vector<std::string> out;
+  for (auto const& descs : ct.describe())
+    for (auto const& ld : descs)
+      for (auto const& bd : ld.buffers)
+        out.push_back(bd.name);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Core roundtrip helper
+// ---------------------------------------------------------------------------
+
+void io_roundtrip(char const* label,
+                  cudf::table_view input,
+                  std::string const& dsl,
+                  std::vector<std::string> column_names = {})
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+
+  // Compress.
+  simpatico::compressed_table ct1 = simpatico::compress_with_plan(
+    input, dsl, stream, rmm::mr::get_current_device_resource_ref(), column_names);
+  expect(ct1.columns.size() == static_cast<std::size_t>(input.num_columns()),
+         (std::string(label) + ": compress column count").c_str());
+
+  // Write.
+  TmpFile tmp;
+  std::string werr = simpatico::write_compressed_table(ct1, tmp.path);
+  expect(werr.empty(), (std::string(label) + ": write error: " + werr).c_str());
+
+  // Read.
+  std::string rerr;
+  simpatico::compressed_table ct2 = simpatico::read_compressed_table(
+    tmp.path, stream, rmm::mr::get_current_device_resource_ref(), &rerr);
+  expect(rerr.empty(), (std::string(label) + ": read error: " + rerr).c_str());
+  expect(ct2.columns.size() == ct1.columns.size(),
+         (std::string(label) + ": read column count").c_str());
+
+  {
+    std::ifstream file(tmp.path, std::ios::binary);
+    file.seekg(4);
+    char version = 0;
+    file.read(&version, 1);
+    expect(version == 17, "file version is independent of codec and nvCOMP build");
+  }
+
+  // Metadata survives.
+  for (std::size_t i = 0; i < ct1.columns.size(); ++i) {
+    auto const& c1 = ct1.columns[i];
+    auto const& c2 = ct2.columns[i];
+    expect(c1.dtype == c2.dtype, (std::string(label) + ": dtype col " + std::to_string(i)).c_str());
+    expect(c1.num_rows == c2.num_rows,
+           (std::string(label) + ": num_rows col " + std::to_string(i)).c_str());
+    expect(c1.name == c2.name, (std::string(label) + ": name col " + std::to_string(i)).c_str());
+    // The plan is persisted structurally (node array), not as DSL text, so the
+    // plan_tree's presence round-trips even though plan_dsl is not restored.
+    expect((c1.plan_tree != nullptr) == (c2.plan_tree != nullptr),
+           (std::string(label) + ": plan_tree presence col " + std::to_string(i)).c_str());
+  }
+
+  // Leaf structure survives (same kinds and buffer names).
+  expect(leaf_kinds(ct1) == leaf_kinds(ct2),
+         (std::string(label) + ": leaf kinds mismatch").c_str());
+  expect(buf_names(ct1) == buf_names(ct2),
+         (std::string(label) + ": buffer names mismatch").c_str());
+
+  // Decompress and compare pixel-exact to original.
+  auto out = simpatico::decompress(ct2, stream, rmm::mr::get_current_device_resource_ref());
+  expect(out != nullptr, (std::string(label) + ": decompress returned null").c_str());
+  expect(out->num_columns() == input.num_columns(),
+         (std::string(label) + ": decompressed column count").c_str());
+  for (int i = 0; i < input.num_columns(); ++i)
+    expect(columns_equal_any(input.column(i), out->view().column(i), stream),
+           (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
+
+  // Codec format identifiers survive reconstruction and re-description.
+  auto const before = ct1.describe(stream);
+  auto const after  = ct2.describe(stream);
+  for (std::size_t ci = 0; ci < before.size(); ++ci) {
+    for (std::size_t li = 0; li < before[ci].size(); ++li) {
+      auto const& a = before[ci][li].meta;
+      auto const& b = after[ci][li].meta;
+      if (auto const* meta = std::get_if<simpatico::leaf_meta::ans>(&a)) {
+        auto const* restored = std::get_if<simpatico::leaf_meta::ans>(&b);
+        expect(restored && restored->payload_format == meta->payload_format &&
+                 restored->payload_format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5),
+               "ANS payload format survives reconstruction");
+      }
+      if (auto const* meta = std::get_if<simpatico::leaf_meta::nvcomp_cascaded>(&a)) {
+        auto const* restored = std::get_if<simpatico::leaf_meta::nvcomp_cascaded>(&b);
+        expect(restored && restored->payload_format == meta->payload_format &&
+                 restored->payload_format == 5,
+               "Cascaded payload format survives reconstruction");
+      }
+    }
+  }
+}
+
+// Serialize `ct` through the production pin-path entry points and read it back:
+// build_compressed_table_header enumerates payload buffers, we assemble the
+// payload host-side, then read_compressed_table_from_memory reconstructs
+// through the same fetch seam pin_table uses. Read errors land in `rerr`.
+simpatico::compressed_table memory_reread(
+  char const* label,
+  simpatico::compressed_table const& ct,
+  std::string& rerr,
+  simpatico::nvcomp_pin_metadata const* pin_metadata = nullptr,
+  std::span<const std::size_t> selected              = {})
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), (std::string(label) + ": header error: " + herr).c_str());
+
+  std::vector<std::uint8_t> payload(payload_bytes);
+  stream.sync();
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0 || b.device_ptr == nullptr) continue;
+    expect(cudaMemcpy(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           (std::string(label) + ": payload staging copy failed").c_str());
+  }
+
+  simpatico::payload_fetch_fn fetch =
+    [&payload](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+      if (cudaMemcpyAsync(dst, payload.data() + off, sz, cudaMemcpyHostToDevice, s.get()) !=
+          cudaSuccess)
+        throw std::runtime_error("memory_roundtrip: fetch copy failed");
+    };
+
+  if (!selected.empty())
+    return simpatico::read_compressed_table_subset_from_memory(
+      header, fetch, selected, stream, mr, &rerr, {}, pin_metadata);
+  return simpatico::read_compressed_table_from_memory(
+    header, fetch, stream, mr, &rerr, std::nullopt, pin_metadata);
+}
+
+// In-memory (pinned-blob) roundtrip; see memory_reread.
+void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+
+  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
+  std::string rerr;
+  simpatico::compressed_table ct2 = memory_reread(label, ct, rerr);
+  expect(rerr.empty(), (std::string(label) + ": read error: " + rerr).c_str());
+
+  auto out = simpatico::decompress(ct2, stream, mr);
+  expect(out != nullptr, (std::string(label) + ": decompress returned null").c_str());
+  expect(out->num_columns() == input.num_columns(),
+         (std::string(label) + ": decompressed column count").c_str());
+  for (int i = 0; i < input.num_columns(); ++i)
+    expect(columns_equal_any(input.column(i), out->view().column(i), stream),
+           (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
+}
+
+void expect_selected_columns(char const* label,
+                             cudf::table const& output,
+                             cudf::table_view const& input,
+                             std::span<const std::size_t> selected,
+                             ::cuda::stream_ref stream)
+{
+  expect(output.num_columns() == static_cast<cudf::size_type>(selected.size()),
+         (std::string(label) + ": output column count").c_str());
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    expect(columns_equal_any(input.column(static_cast<cudf::size_type>(selected[i])),
+                             output.view().column(static_cast<cudf::size_type>(i)),
+                             stream),
+           (std::string(label) + ": data mismatch at output column " + std::to_string(i)).c_str());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// 1. Fused delta→rle→bitpack plan: exercises codegen_fused_representation
+//    serialisation and the multi-buffer fused detect path in rep_from_leaf_desc.
+void test_fused_delta_rle_bitpack()
+{
+  auto t = make_int32_table(1, 4096, 7);
+  io_roundtrip("fused_delta_rle_bitpack",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> rle -> values, runs\n"
+               "delta.differences.values -> bitpack\n"
+               "delta.differences.runs -> bitpack\n");
+}
+
+// 1b. Regression: tail-routed nested RLE on a bitpack metadata channel, at a
+//     scale where the metadata channel is far shorter than the column.
+//
+//     `bitpack` is a fused-tree LEAF (build_fused_tree), so `bitpack.chunk_count
+//     -> rle` is decoded as a SEPARATE codegen subtree whose true length is the
+//     parent's per-chunk count (~ceil(col_rows/kChunkSize)), i.e. ~1000x below
+//     the column row count. The decode grid is ceil(rep->num_rows / kChunkSize),
+//     so the subtree's rep MUST carry its own length. Before the fix,
+//     reconstruction gave every fused rep the *column* row count, so this
+//     subtree launched ceil(col_rows/1024) blocks against per-chunk metadata
+//     built for only ceil(chunk_count_len/1024) chunks — a device out-of-bounds
+//     read (context-fatal on real data / hardware). ~300k rows yields ~293
+//     parent chunks, so the buggy grid overran a 2-entry rle_runs_offsets by
+//     ~290 blocks. The tiny hand-written plans elsewhere never dispatch a nested
+//     metadata subtree at this scale, which is why this went uncaught.
+void test_nested_metadata_rle_scale()
+{
+  auto t = make_int32_table(1, 300000, 5);
+  io_roundtrip("nested_metadata_rle_scale",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+               "bitpack.chunk_min -> identity\n"
+               "bitpack.chunk_bits -> identity\n"
+               "bitpack.packed -> identity\n"
+               "bitpack.chunk_count -> rle -> runs, values\n"
+               "bitpack.chunk_count.runs -> rle -> runs, values\n"
+               "bitpack.chunk_count.values -> rle -> runs, values\n");
+}
+
+// 2. FOR + fused bitpack on deltas: JIT fused region covers both ops.
+void test_for_bitpack()
+{
+  auto t = make_int32_table(1, 4096, 11);
+  io_roundtrip("for_bitpack",
+               t->view(),
+               "input -> for -> deltas, references\n"
+               "for.deltas -> bitpack\n");
+}
+
+// 3. FOR only: deltas stored as Raw fixed-stride leaf (no downstream bitpack).
+void test_for_only()
+{
+  auto t = make_int32_table(1, 4096, 13);
+  io_roundtrip("for_only", t->view(), "input -> for -> deltas, references\n");
+}
+
+// 3b. ZigZag over a Raw passthrough: the stored `zigzag` channel round-trips
+//     terminal and with an entropy tail on it.
+void test_zigzag()
+{
+  auto t = make_int32_table(1, 4096, 113);
+  io_roundtrip("ans_only", t->view(), "input -> ans\n");
+#if NVCOMP_VER_MAJOR < 6
+  io_roundtrip("cascaded_only", t->view(), "input -> nvcomp_cascaded\n");
+#endif
+  io_roundtrip("zigzag_terminal",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> zigzag -> zigzag\n");
+  io_roundtrip("zigzag_ans",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> zigzag -> zigzag\n"
+               "delta.differences.zigzag -> ans\n");
+}
+
+// 4. ALP (floating-point): exercises alp_compressed_representation with its
+//    four output channels and alp_rd leaf_meta on a FLOAT32 column.
+void test_alp_f32()
+{
+  auto t = make_f32_table(1, 4096, 17);
+  io_roundtrip("alp_f32", t->view(), "input -> alp\n");
+}
+
+// Bitextract: multi-output op whose planes are terminal channel leaves,
+// exercising per-node output_names + terminal-slot attachment on read.
+void test_bitextract_f32()
+{
+  auto t = make_f32_table(1, 4096, 29);
+  io_roundtrip(
+    "bitextract_f32", t->view(), "input -> bitextract_f32 -> sign, exponent, mantissa\n");
+}
+
+// Bitjoin DAG: the reconvergent node carries structured attrs (input node refs
+// + channels) that must survive the structural node serialization.
+void test_bitjoin_f32()
+{
+  auto t = make_f32_table(1, 4096, 31);
+  io_roundtrip("bitjoin_f32",
+               t->view(),
+               "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+               "bitextract_f32.sign, bitextract_f32.exponent, bitextract_f32.mantissa "
+               "-> bitjoin_f32 -> rejoined\n");
+}
+
+// ALP-RD (f64): six output channels + right_bw carried in a channel.
+void test_alp_rd_f64()
+{
+  auto t = make_f64_table(1, 4096, 37);
+  io_roundtrip("alp_rd_f64", t->view(), "input -> alp_rd\n");
+}
+
+// Dictionary (STRING): variable channel set on a STRING column, exercising the
+// STRING column dtype tag and keys_offsets/keys_chars/indices channels.
+void test_dictionary()
+{
+  auto t = make_string_table(4096, cudf::get_default_stream());
+  io_roundtrip("dictionary", t->view(), "input -> dictionary\n");
+}
+
+// PlanNode::dictionary_key_width_hint is never serialized: both readers derive it from the stored
+// tree, so a read publishes the value the compress walk did, -1 where neither can know (a consumed
+// keys_offsets), and -1 where only the reader declines to look (a key set above its readback bound,
+// kMaxHintOffsets in api/compressed_table_io.cpp).
+void test_dictionary_key_width_hint()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+  auto const make_input     = [&](std::vector<std::string> const& keys) {
+    std::vector<std::string> values(2048);
+    for (std::size_t i = 0; i < values.size(); ++i)
+      values[i] = keys[(i * 5 + i / 7) % keys.size()];
+    return make_strings_column(values, {}, stream);
+  };
+  // 65536 distinct six-byte keys, one per row, give 65537 offsets: one past the reader's bound.
+  std::vector<std::string> many_keys(65536);
+  for (std::size_t i = 0; i < many_keys.size(); ++i) {
+    auto const digits = std::to_string(i);
+    many_keys[i]      = "K" + std::string(5 - digits.size(), '0') + digits;
+  }
+  constexpr char const* identity_offsets_plan =
+    "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+    "dictionary.indices -> bitpack\n";
+  struct shape {
+    char const* label;
+    std::unique_ptr<cudf::column> input;
+    char const* plan;
+    std::int64_t encode_expected;
+    std::int64_t read_expected;
+  };
+  std::vector<std::string> const uniform{"AB", "CD", "EF"};
+  std::vector<std::string> const variable{"A", "BB", "CCC"};
+  shape const shapes[] = {
+    {"self", make_input(uniform), "input -> dictionary\n", 2, 2},
+    {"one-byte keys", make_input({"A", "N", "R"}), identity_offsets_plan, 1, 1},
+    {"variable width self", make_input(variable), "input -> dictionary\n", 0, 0},
+    {"identity offsets", make_input(uniform), identity_offsets_plan, 2, 2},
+    {"bitpacked offsets",
+     make_input(uniform),
+     "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+     "dictionary.keys_offsets -> bitpack\n"
+     "dictionary.indices -> bitpack\n",
+     -1,
+     -1},
+    {"variable width", make_input(variable), identity_offsets_plan, 0, 0},
+    {"key set above the readback bound",
+     make_strings_column(many_keys, {}, stream),
+     identity_offsets_plan,
+     6,
+     -1},
+  };
+  auto hint_of = [](simpatico::compressed_table const& table) {
+    auto const& nodes = table.columns.front().plan_tree->nodes;
+    auto const node   = std::find_if(nodes.begin(), nodes.end(), [](simpatico::PlanNode const& n) {
+      return n.op == "dictionary";
+    });
+    expect(node != nodes.end(), "dictionary hint: plan has no dictionary node");
+    return node->dictionary_key_width_hint;
+  };
+  auto verify = [&](shape const& s,
+                    char const* producer,
+                    simpatico::compressed_table const& table,
+                    std::int64_t expected) {
+    auto const context = std::string("dictionary hint: ") + s.label + ", " + producer;
+    expect(hint_of(table) == expected, (context + ": value").c_str());
+    auto out = simpatico::decompress(table, stream, mr);
+    expect(out != nullptr && out->num_columns() == 1 &&
+             columns_equal_any(s.input->view(), out->view().column(0), stream),
+           (context + ": data mismatch").c_str());
+  };
+  for (auto const& s : shapes) {
+    auto ct =
+      simpatico::compress_with_plan(cudf::table_view{{s.input->view()}}, s.plan, stream, mr);
+    verify(s, "encode", ct, s.encode_expected);
+    TmpFile tmp;
+    std::string werr = simpatico::write_compressed_table(ct, tmp.path);
+    expect(werr.empty(), "dictionary hint: write error");
+    std::string rerr;
+    auto from_file = simpatico::read_compressed_table(tmp.path, stream, mr, &rerr);
+    expect(rerr.empty(), "dictionary hint: file read error");
+    verify(s, "file read", from_file, s.read_expected);
+    std::string merr;
+    auto from_memory = memory_reread("dictionary_key_width_hint", ct, merr);
+    expect(merr.empty(), "dictionary hint: memory read error");
+    verify(s, "memory read", from_memory, s.read_expected);
+  }
+}
+
+// Exercise a self-stored frame and a routed output whose temporary representation
+// is rebuilt at a new payload address on every decode.
+void test_nvcomp_frame_layout(char const* codec)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  auto input             = make_int32_table(2, 32769, 37);  // multi-chunk with a short final chunk
+  std::string const plan = std::string{"input -> "} + codec;
+  std::vector<std::size_t> const both{0, 1}, projected{1, 0, 1};
+  auto verify = [&](simpatico::compressed_table const& table,
+                    std::span<const std::size_t> indices,
+                    std::size_t readbacks) {
+    auto const before = simpatico::host_observations.readbacks;
+    auto out          = table.decompress(stream, mr);
+    expect(simpatico::host_observations.readbacks - before == readbacks, "frame metadata reads");
+    expect_selected_columns(codec, *out, input->view(), indices, stream);
+  };
+
+  std::string error;
+  auto stored =
+    simpatico::compress_with_plan(input->view(), plan + "\n---\n" + plan + "\n", stream, mr);
+  verify(stored, both, 0);
+  auto const uncached = memory_reread(codec, stored, error);
+  expect(error.empty(), "uncached memory read");
+  verify(uncached, both, 4);  // header and size vector per frame
+
+  TmpFile file;
+  expect(simpatico::write_compressed_table(stored, file.path, stream).empty(), "write frames");
+  auto const before = simpatico::host_observations.readbacks;
+  auto const loaded = simpatico::read_compressed_table(file.path, stream, mr, &error);
+  expect(error.empty() && simpatico::host_observations.readbacks == before, "host file parse");
+  verify(loaded, both, 0);
+
+  auto routed = simpatico::compress_with_plan(
+    input->view(), plan + "\n---\n" + plan + " -> output\n", stream, mr);
+  expect(!routed.columns[1].plan_tree->nodes[1].rep, "second frame uses routed reconstruction");
+  auto layouts = simpatico::collect_nvcomp_pin_metadata(routed);
+  expect(layouts != nullptr, "pin has frame metadata");
+  verify(routed, both, 0);
+  auto const before_pin = simpatico::host_observations.readbacks;
+  auto const relocated  = memory_reread(codec, routed, error, layouts.get());
+  expect(error.empty(), "full pin read");
+  auto const subset = memory_reread(codec, routed, error, layouts.get(), projected);
+  expect(error.empty() && simpatico::host_observations.readbacks == before_pin,
+         "pin reconstruction reuses the captured layouts");
+  routed = {};
+  layouts.reset();
+  verify(relocated, both, 0);
+  verify(subset, projected, 0);
+  verify(subset, projected, 0);
+}
+
+// 5. Multi-column: three columns with three different plans in one file.
+//    Verifies the column loop in write/read and that per-column plans don't bleed.
+void test_multi_column()
+{
+  auto t = make_int32_table(3, 2048, 21);
+  io_roundtrip("multi_column",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> rle -> values, runs\n"
+               "delta.differences.values -> bitpack\n"
+               "delta.differences.runs -> bitpack\n"
+               "---\n"
+               "input -> for -> deltas, references\n"
+               "for.deltas -> bitpack\n"
+               "---\n"
+               "input -> for -> deltas, references\n");
+}
+
+// Selective decompression preserves requested order and duplicates, accepts an
+// empty projection, rejects invalid indices, and never touches an unselected
+// column. Exercise all three overload families.
+void test_selective_decompression()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+  auto t                    = make_int32_table(3, 2048, 29);
+  auto ct                   = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                                            "---\n"
+                                                            "input -> delta -> differences\n"
+                                                            "delta.differences -> bitpack\n"
+                                                            "---\n"
+                                                            "input -> bitpack\n",
+                                          stream,
+                                          mr);
+
+  // If an implementation accidentally decompresses every column before
+  // projecting, this deliberately invalid unselected column makes that visible.
+  ct.columns[1].plan_tree.reset();
+
+  std::vector<std::size_t> reordered_with_duplicate{2, 0, 2};
+  auto sequential = simpatico::decompress(ct, reordered_with_duplicate, stream, mr);
+  expect(sequential != nullptr, "selective sequential: decompress returned null");
+  expect_selected_columns(
+    "selective sequential", *sequential, t->view(), reordered_with_duplicate, stream);
+
+  std::vector<std::size_t> reordered{2, 0};
+  auto threaded = simpatico::decompress(ct, reordered, 2, mr);
+  expect(threaded != nullptr, "selective threaded: decompress returned null");
+  expect_selected_columns("selective threaded", *threaded, t->view(), reordered, stream);
+
+  simpatico::stream_pool pool;
+  expect(pool.init(2), "selective stream_pool: init failed");
+  auto pooled = simpatico::decompress(ct, reordered, pool, mr);
+  pool.sync_all();
+  expect(pooled != nullptr, "selective stream_pool: decompress returned null");
+  expect_selected_columns("selective stream_pool", *pooled, t->view(), reordered, stream);
+
+  std::vector<std::size_t> empty_selection;
+  auto empty = simpatico::decompress(ct, empty_selection, stream, mr);
+  expect(empty != nullptr && empty->num_columns() == 0, "selective empty: expected an empty table");
+
+  std::vector<std::size_t> invalid{0, 3};
+  bool threw = false;
+  try {
+    (void)simpatico::decompress(ct, invalid, stream, mr);
+  } catch (std::runtime_error const&) {
+    threw = true;
+  }
+  expect(threw, "selective invalid: expected out-of-range exception");
+}
+
+// The subset in-memory reader must reconstruct only requested columns. Its
+// payload callback is instrumented so this test checks I/O exclusion directly,
+// in addition to metadata, order, duplicate, empty, and error behavior.
+void test_memory_subset_read()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+  auto t                    = make_int32_table(3, 2048, 37);
+  auto ct                   = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                                            "---\n"
+                                                            "input -> delta -> differences\n"
+                                                            "delta.differences -> bitpack\n"
+                                                            "---\n"
+                                                            "input -> bitpack\n",
+                                          stream,
+                                          mr,
+                                                            {"first", "second", "third"});
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), ("memory subset: header error: " + herr).c_str());
+
+  std::vector<std::uint8_t> payload(payload_bytes);
+  stream.sync();
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0 || b.device_ptr == nullptr) continue;
+    expect(cudaMemcpy(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           "memory subset: payload staging copy failed");
+  }
+
+  auto const descriptions = ct.describe(stream);
+  std::vector<std::size_t> buffer_owner;
+  for (std::size_t ci = 0; ci < ct.num_columns(); ++ci) {
+    for (auto const& leaf : descriptions[ci]) {
+      for (std::size_t bi = 0; bi < leaf.buffers.size(); ++bi)
+        buffer_owner.push_back(ci);
+    }
+  }
+  expect(buffer_owner.size() == buffers.size(), "memory subset: buffer owner map mismatch");
+
+  std::vector<std::size_t> selected{2, 0, 2};
+  std::string rerr;
+  rmm::mr::statistics_resource_adaptor stats{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{mr}};
+  auto const upload_mr = rmm::device_async_resource_ref{stats};
+  // Unwind after the first transfer, then retry the same projection from the host payload.
+  std::size_t copies = 0;
+  try {
+    simpatico::compressed_leaf_slab attempt;
+    (void)simpatico::read_uploaded_compressed_table(
+      header,
+      [&](std::uint64_t off, std::size_t size, void* dst, cuda::stream_ref lane) {
+        if (copies++) throw rmm::out_of_memory("injected upload failure");
+        cuda_check(
+          cudaMemcpyAsync(dst, payload.data() + off, size, cudaMemcpyHostToDevice, lane.get()));
+      },
+      selected,
+      stream,
+      upload_mr,
+      attempt,
+      &rerr);
+    throw std::runtime_error("injected upload failure did not propagate");
+  } catch (rmm::out_of_memory const&) {
+    expect(copies == 2, "interrupted a partially submitted upload");
+  }
+  expect(stats.get_bytes_counter().value == 0, "failed reconstruction released its slab");
+  auto const before_retry = stats.get_allocations_counter().total;
+  simpatico::compressed_leaf_slab slab;
+  std::size_t expected_offset = 0;
+  bool fetched_first          = false;
+  bool fetched_third          = false;
+  std::size_t fetch_count     = 0;
+  simpatico::payload_fetch_fn fetch =
+    [&](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+      ++fetch_count;
+      auto const alignment = simpatico::compressed_leaf_slab::alignment;
+      expect(dst == static_cast<std::byte*>(slab.data()) + expected_offset,
+             "projected leaf has its own aligned slice in the batch allocation");
+      expected_offset += (sz + alignment - 1) / alignment * alignment;
+      auto const it = std::find_if(buffers.begin(), buffers.end(), [&](auto const& b) {
+        return b.offset == off && b.size_bytes == sz;
+      });
+      expect(it != buffers.end(), "memory subset: fetched unknown payload range");
+      auto const bi    = static_cast<std::size_t>(std::distance(buffers.begin(), it));
+      auto const owner = buffer_owner[bi];
+      expect(owner != 1, "memory subset: fetched unselected second column");
+      fetched_first = fetched_first || owner == 0;
+      fetched_third = fetched_third || owner == 2;
+      if (cudaMemcpyAsync(dst, payload.data() + off, sz, cudaMemcpyHostToDevice, s.get()) !=
+          cudaSuccess)
+        throw std::runtime_error("memory subset: fetch copy failed");
+    };
+
+  auto subset = simpatico::read_uploaded_compressed_table(
+    header, fetch, selected, stream, upload_mr, slab, &rerr);
+  expect(stats.get_allocations_counter().total == before_retry + 1,
+         "one upstream allocation covers all temporary leaves in the projected batch");
+  expect(slab.size() == expected_offset, "backing covers only the projected leaves");
+  expect(rerr.empty(), ("memory subset: read error: " + rerr).c_str());
+  expect(subset.num_columns() == selected.size(), "memory subset: compressed column count");
+  expect(subset.columns[0].name == std::optional<std::string>{"third"} &&
+           subset.columns[1].name == std::optional<std::string>{"first"} &&
+           subset.columns[2].name == std::optional<std::string>{"third"},
+         "memory subset: names do not preserve selection order and duplicates");
+  expect(fetch_count > 0 && fetched_first && fetched_third,
+         "memory subset: selected payloads were not fetched");
+
+  auto out = simpatico::decompress(subset, stream, mr);
+  expect(out != nullptr, "memory subset: decompress returned null");
+  expect_selected_columns("memory subset", *out, t->view(), selected, stream);
+
+  // Reject the aggregate allocation while allowing each smaller projected leaf.
+  bool hit_limit = false;
+  rmm::mr::callback_memory_resource fragmented{
+    [&](std::size_t bytes, cuda::stream_ref s, void*) {
+      if (bytes >= slab.size()) {
+        hit_limit = true;
+        throw rmm::out_of_memory("aggregate allocation exceeds available block");
+      }
+      return mr.allocate(s, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+    },
+    [&](void* ptr, std::size_t bytes, cuda::stream_ref s, void*) {
+      mr.deallocate(s, ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+    }};
+  simpatico::compressed_leaf_slab fallback_slab;
+  auto fallback = simpatico::read_uploaded_compressed_table(
+    header,
+    [&](std::uint64_t off, std::size_t bytes, void* dst, cuda::stream_ref s) {
+      cuda_check(cudaMemcpyAsync(dst, payload.data() + off, bytes, cudaMemcpyHostToDevice, s.get()));
+    },
+    selected,
+    stream,
+    rmm::device_async_resource_ref{fragmented},
+    fallback_slab,
+    &rerr);
+  expect(hit_limit && fallback_slab.size() == 0, "fragmented pool used individual leaves");
+  expect(rerr.empty(), "fragmented upload failed");
+  auto fallback_out = simpatico::decompress(fallback, stream, mr);
+  expect_selected_columns("fragmented pool", *fallback_out, t->view(), selected, stream);
+
+  std::size_t empty_fetch_count = 0;
+  simpatico::payload_fetch_fn empty_fetch =
+    [&](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) { ++empty_fetch_count; };
+  std::vector<std::size_t> empty_selection;
+  rerr.clear();
+  simpatico::compressed_leaf_slab empty_slab;
+  auto empty = simpatico::read_uploaded_compressed_table(
+    header, empty_fetch, empty_selection, stream, mr, empty_slab, &rerr);
+  expect(empty_slab.size() == 0, "empty projection needs no backing allocation");
+  expect(rerr.empty(), "memory subset empty: unexpected read error");
+  expect(empty.num_columns() == 0, "memory subset empty: expected zero columns");
+  expect(empty_fetch_count == 0, "memory subset empty: payload callback was invoked");
+
+  std::vector<std::size_t> invalid{0, 3};
+  rerr.clear();
+  auto invalid_result = simpatico::read_compressed_table_subset_from_memory(
+    header, empty_fetch, invalid, stream, mr, &rerr);
+  expect(!rerr.empty(), "memory subset invalid: expected an error");
+  expect(invalid_result.num_columns() == 0, "memory subset invalid: expected empty result");
+  expect(empty_fetch_count == 0, "memory subset invalid: payload callback was invoked");
+}
+
+// 6. Column names survive write→read.
+void test_column_names_survive()
+{
+  auto t = make_int32_table(2, 1024, 3);
+  io_roundtrip("column_names_survive",
+               t->view(),
+               "input -> for -> deltas, references\n"
+               "---\n"
+               "input -> for -> deltas, references\n",
+               {"price", "volume"});
+}
+
+// 7. Zero-row table: edge case that should produce an empty but valid file
+//    that round-trips without error.
+void test_zero_rows()
+{
+  auto t = make_int32_table(1, 0, 0);
+  io_roundtrip("zero_rows",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> rle -> values, runs\n"
+               "delta.differences.values -> bitpack\n"
+               "delta.differences.runs -> bitpack\n");
+}
+
+// 8. Error: file does not exist.
+void test_error_not_found()
+{
+  std::string err;
+  auto ct = simpatico::read_compressed_table("/nonexistent/path/that/does/not/exist.hpln",
+                                             cudf::get_default_stream(),
+                                             rmm::mr::get_current_device_resource_ref(),
+                                             &err);
+  expect(!err.empty(), "error_not_found: expected non-empty error");
+  expect(ct.columns.empty(), "error_not_found: expected empty result");
+}
+
+// Error: a stored edge that names a channel its producer does not output is reported through the
+// reader's error string, not thrown and not wired to another channel.
+void test_error_unknown_edge_channel()
+{
+  auto t         = make_int32_table(1, 4096, 17);
+  auto ct        = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                                 "for.deltas -> bitpack\n",
+                                          cudf::get_default_stream(),
+                                          rmm::mr::get_current_device_resource_ref());
+  auto& producer = ct.columns[0].plan_tree->nodes[1];
+  expect(producer.op == "for" && producer.children.size() == 1, "error_unknown_edge: plan shape");
+  producer.children.front().channel = "unknown";
+  std::string err;
+  auto const reread = memory_reread("error_unknown_edge", ct, err);
+  expect(err.find("does not output") != std::string::npos,
+         ("error_unknown_edge: unexpected error '" + err + "'").c_str());
+  expect(reread.columns.empty(), "error_unknown_edge: expected empty result");
+}
+
+// Error: a non-HPLN file (garbage) is rejected rather than crashing.
+void test_error_garbage()
+{
+  TmpFile tmp;
+  {
+    std::ofstream f(tmp.path, std::ios::binary);
+    f.write("garbage data", 12);
+  }
+  std::string err;
+  auto ct = simpatico::read_compressed_table(
+    tmp.path, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &err);
+  expect(!err.empty(), "error_garbage: expected non-empty error");
+  expect(ct.columns.empty(), "error_garbage: expected empty result");
+}
+
+// Error: wrong magic bytes.
+void test_error_bad_magic()
+{
+  TmpFile tmp;
+  {
+    std::ofstream f(tmp.path, std::ios::binary);
+    char bad[] = {'X', 'X', 'X', 'X', 8, 0, 0};
+    f.write(bad, sizeof(bad));
+  }
+  std::string err;
+  auto ct = simpatico::read_compressed_table(
+    tmp.path, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &err);
+  expect(!err.empty(), "error_bad_magic: expected non-empty error");
+}
+
+// Malformed/incompatible codec metadata must be rejected while parsing, before
+// payload allocation/fetch or a codec call. Construct only the header prefix
+// through the format byte: parsing an accepted format would hit a truncated
+// buffer count instead, which must not satisfy these assertions.
+void test_nvcomp_payload_compatibility()
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  for (bool cascaded : {false, true}) {
+    for (std::uint8_t format :
+         {std::uint8_t{0}, std::uint8_t{5}, std::uint8_t{6}, std::uint8_t{255}}) {
+      bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
+      bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
+      if (matches && !unavailable) continue;
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 17};
+      auto append = [&](std::uint64_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i)
+          header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+      };
+      append(1, 2);  // columns
+      append(0, 2);  // name length
+      append(static_cast<std::uint8_t>(cudf::type_id::INT32), 1);
+      append(0, 4);           // scale
+      append(1, 8);           // rows
+      append(0, 1);           // all-valid
+      append(0, 2);           // nodes
+      append(1, 2);           // leaves
+      append(0, 4);           // node index
+      append(0xffffffff, 4);  // own representation
+      append(static_cast<std::uint8_t>(cascaded ? simpatico::OpId::NvcompCascaded
+                                                : simpatico::OpId::Ans),
+             1);
+      append(static_cast<std::uint8_t>(cudf::type_id::INT32), 1);
+      append(1, 8);                 // leaf rows
+      append(cascaded ? 4 : 2, 1);  // metadata kind
+      append(4, 8);                 // uncompressed bytes
+      append(static_cast<std::int32_t>(cudf::type_id::INT32), 4);
+      if (cascaded) {
+        append(1, 4);  // deltas
+        append(2, 4);  // RLEs
+        append(1, 4);  // bitpack
+      }
+      append(format, 1);
+      bool fetched = false;
+      std::string error;
+      auto result = simpatico::read_compressed_table_from_memory(
+        header,
+        [&](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) { fetched = true; },
+        stream,
+        mr,
+        &error);
+      expect(result.columns.empty() && !fetched,
+             "incompatible codec rejected before payload fetch");
+      auto const expected = matches ? "unavailable with nvCOMP 6" : "incompatible payload format";
+      expect(error.find(expected) != std::string::npos, "codec metadata compatibility error");
+    }
+  }
+}
+
+// Reconstruction must preserve the format, and must guard callers that do not
+// come through the .hpln parser (e.g. the decode bridge).
+void test_nvcomp_reconstruction_metadata()
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  for (bool cascaded : {false, true}) {
+    for (std::uint8_t format :
+         {std::uint8_t{0}, std::uint8_t{5}, std::uint8_t{6}, std::uint8_t{255}}) {
+      simpatico::leaf_meta_v meta;
+      if (cascaded) {
+        meta = simpatico::leaf_meta::nvcomp_cascaded{
+          {0, static_cast<std::int32_t>(cudf::type_id::INT32)}, 1, 2, 1, format};
+      } else {
+        meta =
+          simpatico::leaf_meta::ans{{0, static_cast<std::int32_t>(cudf::type_id::INT32)}, format};
+      }
+      std::vector<std::unique_ptr<cudf::column>> channels;
+      channels.push_back(cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      std::string error;
+      auto rep = simpatico::reconstruct_representation(cascaded ? "nvcomp_cascaded" : "ans",
+                                                       {"output"},
+                                                       std::move(channels),
+                                                       stream,
+                                                       mr,
+                                                       &error,
+                                                       meta);
+      bool const supported =
+        format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5) && !(cascaded && NVCOMP_VER_MAJOR >= 6);
+      if (!supported) {
+        expect(!rep && !error.empty(), "reconstruction rejects incompatible codec metadata");
+        continue;
+      }
+      expect(rep != nullptr && error.empty(), "compatible codec reconstructs");
+      auto const described = rep->describe_meta();
+      auto const restored_format =
+        cascaded ? std::get<simpatico::leaf_meta::nvcomp_cascaded>(described).payload_format
+                 : std::get<simpatico::leaf_meta::ans>(described).payload_format;
+      expect(restored_format == format, "reconstruction preserves codec format in describe_meta");
+
+      // Directly constructed representations must also reject a mismatched
+      // format, even when the empty payload would otherwise bypass the codec.
+      auto const other_format = static_cast<std::uint8_t>(format == 5 ? 6 : 5);
+      if (cascaded) {
+        dynamic_cast<simpatico::cascaded_compressed_representation&>(*rep).payload_format =
+          other_format;
+      } else {
+        dynamic_cast<simpatico::ans_compressed_representation&>(*rep).payload_format = other_format;
+      }
+      bool rejected = false;
+      try {
+        (void)simpatico::decompress_standalone_representation(rep.get(), stream, mr, &error);
+      } catch (std::runtime_error const& e) {
+        rejected =
+          std::string_view(e.what()).find("incompatible payload format") != std::string_view::npos;
+      }
+      expect(rejected, "standalone decode rejects incompatible codec metadata");
+    }
+  }
+}
+
+// Error: correct magic but unsupported version number.
+void test_error_bad_version()
+{
+  for (std::uint8_t version :
+       {std::uint8_t{12}, std::uint8_t{13}, std::uint8_t{16}, std::uint8_t{99}}) {
+    std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', version, 0, 0};
+    bool fetched = false;
+    std::string error;
+    auto result = simpatico::read_compressed_table_from_memory(
+      header,
+      [&](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) { fetched = true; },
+      cudf::get_default_stream(),
+      rmm::mr::get_current_device_resource_ref(),
+      &error);
+    expect(result.columns.empty() && !fetched, "old/unknown file version rejected before fetch");
+    expect(error.find("unsupported version") != std::string::npos,
+           "unsupported file version error");
+  }
+}
+
+// Error: identity on a STRING column has no single contiguous payload buffer;
+// build_compressed_table_header must reject it loudly and clear its outputs.
+// identity on a STRING column decomposes via str_split, so it round-trips to
+// file (both the file path and the in-memory pin path).
+void test_identity_string_roundtrip()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_string_table(128, stream);
+  io_roundtrip("identity_string", input->view(), "input -> identity\n");
+  memory_roundtrip("identity_string_mem", input->view(), "input -> identity\n");
+}
+
+// The two production STRING plan shapes from plans/tpch_sf1000 (customer/
+// supplier): variable-length "address" (offsets delta -> ans) and constant-
+// length "phone" (offsets delta -> rle with terminal runs/values). Exercised
+// through BOTH the file path and the in-memory pin path — the shapes the
+// rerouted sf1000 plans serialize in production.
+void test_str_split_plan_shapes_roundtrip()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+
+  std::vector<std::string> addresses;
+  std::vector<std::string> phones;
+  addresses.reserve(512);
+  phones.reserve(512);
+  for (int i = 0; i < 512; ++i) {
+    addresses.push_back("No. " + std::to_string((i * 37) % 990) + " Elm Street, Apt " +
+                        std::to_string(i % 97));
+    char buf[16];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "%02d-%03d-%03d-%03d",
+                  i % 100,
+                  (i * 7) % 1000,
+                  (i * 13) % 1000,
+                  (i * 31) % 1000);
+    phones.emplace_back(buf);  // constant length 14 — one RLE run of offset deltas
+  }
+  auto addr_tbl  = make_strings_table(addresses, {}, stream);
+  auto phone_tbl = make_strings_table(phones, {}, stream);
+
+  std::string const address_dsl =
+    "input -> str_split -> offsets, chars\n"
+    "str_split.offsets -> delta -> differences\n"
+    "str_split.chars -> deflate\n"
+    "str_split.offsets.differences -> ans\n";
+  std::string const phone_dsl =
+    "input -> str_split -> offsets, chars\n"
+    "str_split.offsets -> delta -> differences\n"
+    "str_split.offsets.differences -> rle -> runs, values\n"
+    "str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "str_split.chars.packed -> deflate\n"
+    "str_split.chars.chunk_count -> rle -> runs, values\n"
+    "str_split.chars.chunk_bits -> bitcomp\n"
+    "str_split.chars.chunk_min -> rle -> runs, values\n";
+
+  io_roundtrip("str_split_address_shape", addr_tbl->view(), address_dsl);
+  io_roundtrip("str_split_phone_shape", phone_tbl->view(), phone_dsl);
+  memory_roundtrip("str_split_address_shape_mem", addr_tbl->view(), address_dsl);
+  memory_roundtrip("str_split_phone_shape_mem", phone_tbl->view(), phone_dsl);
+
+  // Bare terminal: the str_split rep itself is the node's stored leaf.
+  std::string const bare_dsl = "input -> str_split\n";
+  io_roundtrip("str_split_bare_terminal", addr_tbl->view(), bare_dsl);
+  memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
+}
+
+// Validity survives both serialization paths. The sidecar is not a leaf, so it
+// travels in its own per-column header record rather than through describe() --
+// this covers the file path, the pinned in-memory path, and the two fast paths
+// that write no payload bytes at all.
+void test_validity_sidecar_roundtrip()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  // Cross the first quarter of a padded mask allocation and end on a partial word.
+  // Treating a typed CUDA mask's element count as bytes loses the trailing nulls.
+  constexpr cudf::size_type num_rows = 4097;
+  auto mixed                         = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  std::vector<std::int32_t> host(num_rows);
+  for (int r = 0; r < num_rows; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 31 + 7) % 5000);
+  if (cudaMemcpy(mixed->mutable_view().head<std::int32_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("validity_sidecar: cudaMemcpy failed");
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 70, 96, /*valid=*/false, stream);
+  cudf::set_null_mask(
+    mixed->mutable_view().null_mask(), num_rows - 1, num_rows, /*valid=*/false, stream);
+  mixed->set_null_count(28);
+  cudf::table_view mixed_tbl({mixed->view()});
+  io_roundtrip("validity_mixed", mixed_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_mixed_mem", mixed_tbl, "input -> delta -> differences\n");
+
+  // Rebase a mask starting mid-word, then reattach it twice without consuming the sidecar.
+  auto const input = mixed->view();
+  cudf::column_view sliced(
+    input.type(), num_rows - 3, input.head<void>(), input.null_mask(), input.null_count(), 3);
+  simpatico::validity_sidecar sidecar;
+  auto const stripped = simpatico::strip_validity(sliced, sidecar, stream, mr);
+  expect(sidecar.mask.size() == cudf::bitmask_allocation_size_bytes(sliced.size()),
+         "validity_sliced: sidecar size is in bytes");
+  cudf::column expected(sliced, stream, mr);
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    cudf::column restored(stripped, stream, mr);
+    simpatico::attach_validity(restored, sidecar, stream, mr);
+    expect(columns_equal(expected.view(), restored.view()),
+           "validity_sliced: repeated reattachment preserves data and validity");
+  }
+
+  // All null: nothing is written to the payload, so this also checks that the
+  // reader rebuilds the mask from the kind alone.
+  auto all_null = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  all_null->set_null_count(64);
+  cudf::table_view an_tbl({all_null->view()});
+  io_roundtrip("validity_all_null", an_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_all_null_mem", an_tbl, "input -> delta -> differences\n");
+
+  // Nullable STRING through str_split, where validity used to be a routed channel.
+  std::vector<bool> valid = {true, false, true, true, false, true};
+  auto strs = make_strings_table({"alpha", "", "gamma", "delta", "x", "zeta"}, valid, stream);
+  io_roundtrip("validity_strings", strs->view(), "input -> str_split\n");
+  memory_roundtrip("validity_strings_mem", strs->view(), "input -> str_split\n");
+}
+
+// A nullable column's mask must be attributed to its own column (a projection sizes
+// columns from the per-buffer index), and a header whose validity record contradicts the
+// column is rejected at parse time rather than trusted.
+void test_validity_header_integrity()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto plain = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto nullable = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  nullable->set_null_count(1);
+  cudf::table_view tbl({plain->view(), nullable->view()});
+
+  auto ct = simpatico::compress_with_plan(
+    tbl, "input -> delta -> differences\n---\ninput -> delta -> differences\n", stream, mr);
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), "validity_header_integrity: header error");
+  auto const mask_ptr = ct.columns[1].plan_tree->validity.mask.data();
+  bool found          = false;
+  for (auto const& b : buffers)
+    if (b.device_ptr == mask_ptr) {
+      found = true;
+      expect(b.column_index == 1, "validity_header_integrity: mask attributed to wrong column");
+    }
+  expect(found, "validity_header_integrity: mask buffer not listed");
+
+  // All-null column whose stored null_count disagrees with num_rows.
+  auto an = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  an->set_null_count(64);
+  cudf::table_view an_tbl({an->view()});
+  auto an_ct = simpatico::compress_with_plan(an_tbl, "input -> delta -> differences\n", stream, mr);
+  header.clear();
+  buffers.clear();
+  expect(
+    simpatico::build_compressed_table_header(an_ct, header, buffers, payload_bytes, stream).empty(),
+    "validity_header_integrity: all-null header error");
+  // num_rows (int64 64), kind (1 = all_null), null_count (int64 64).
+  std::vector<std::uint8_t> const pat = {64, 0, 0, 0, 0, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 0};
+  auto it = std::search(header.begin(), header.end(), pat.begin(), pat.end());
+  expect(it != header.end(), "validity_header_integrity: validity record not located");
+  *(it + 9)                         = 5;
+  simpatico::payload_fetch_fn fetch = [](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) {};
+  std::string rerr;
+  simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  expect(!rerr.empty(), "validity_header_integrity: corrupt null_count accepted");
+}
+
+}  // namespace
+
+// DECIMAL128 through bitpack, over BOTH serialization seams.
+//
+// This is the only layer that can catch a meta channel whose cudf dtype is
+// narrower than its real elements. describe() derives a channel's serialized
+// length as size() * size_of(type), so a 16-byte chunk_min/chunk_divisors
+// mislabelled as INT32 ships a quarter of itself and decode reads the rest as
+// whatever follows. An in-memory roundtrip cannot see it: compress_with_plan ->
+// decompress binds those columns by pointer and never consults the dtype.
+//
+// The values are small multiples of 100 rather than magnitudes above 2^64, so
+// bitpack's `_gwide` flag stays clear and the folded-in GCD actually reduces --
+// the 128-bit divisor path is otherwise skipped entirely.
+void test_decimal128_bitpack_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 17);
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  // The spill path stages through build_compressed_table_header, not the file
+  // writer, so cover that seam too.
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+}
+
+// An identity leaf keeps its column's type, so a decimal read back must be rebuilt
+// as a fixed-width column; make_numeric_column rejects decimal and chrono types.
+void test_decimal128_identity_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 23);
+  io_roundtrip("decimal128_identity", t->view(), "input -> identity\n");
+  memory_roundtrip("decimal128_identity_memory", t->view(), "input -> identity\n");
+}
+
+// The same column under the plan the spill path actually emits, which names the
+// four original channels and leaves `chunk_divisors` to ride along as a trailing
+// one. A channel that is written but not named is exactly where a width bug
+// hides, so pin it explicitly rather than relying on the bare-op form above.
+void test_decimal128_bitpack_named_channels()
+{
+  auto t = make_decimal128_table(1, 4096, 19);
+  io_roundtrip("decimal128_bitpack_named",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  memory_roundtrip("decimal128_bitpack_named_memory",
+                   t->view(),
+                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+}
+
+// Trees with a Bitpack or an Rle are measured and then packed straight into place, Raw
+// passthrough leaves included. Columns of several chunks with a partial last one round-trip,
+// for every lane width.
+void test_measured_encode_roundtrip()
+{
+  constexpr int rows = 10 * 1024 + 500;
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  tables.push_back(make_int32_table(1, rows, 3));
+  tables.push_back(make_int64_table(1, rows, 5));
+  tables.push_back(make_decimal128_table(1, rows, 7));
+  std::string const plans[] = {
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> delta -> differences\n"
+    "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> delta -> differences\n"
+    "delta.differences -> rle -> runs, values\n"
+    "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> for -> deltas, references\n"
+    "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> zigzag -> zigzag\n"
+    "zigzag.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.runs -> ans\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "rle.values -> delta -> differences\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> zigzag -> zigzag\n"
+    "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> rle -> runs, values\n"
+    "rle.runs -> zigzag -> zigzag\n"
+    "rle.runs.zigzag -> ans\n"
+    "rle.values -> for -> deltas, references\n",
+  };
+  for (auto const& table : tables) {
+    for (auto const& plan : plans) {
+      auto const label = "measured encode: " + plan;
+      io_roundtrip(label.c_str(), table->view(), plan);
+      memory_roundtrip(label.c_str(), table->view(), plan);
+    }
+  }
+}
+
+int main()
+{
+  if (cudaSetDevice(0) != cudaSuccess) {
+    std::fprintf(stderr, "test_compressed_table_io: cudaSetDevice failed\n");
+    return 1;
+  }
+
+  struct Case {
+    char const* name;
+    void (*fn)();
+  };
+  Case cases[] = {
+    {"fused_delta_rle_bitpack", test_fused_delta_rle_bitpack},
+    {"nested_metadata_rle_scale", test_nested_metadata_rle_scale},
+    {"for_bitpack", test_for_bitpack},
+    {"for_only", test_for_only},
+    {"zigzag", test_zigzag},
+    {"alp_f32", test_alp_f32},
+    {"bitextract_f32", test_bitextract_f32},
+    {"bitjoin_f32", test_bitjoin_f32},
+    {"alp_rd_f64", test_alp_rd_f64},
+    {"dictionary", test_dictionary},
+    {"dictionary_key_width_hint", test_dictionary_key_width_hint},
+    {"snappy_frame_layout", [] { test_nvcomp_frame_layout("snappy"); }},
+    {"ans_frame_layout", [] { test_nvcomp_frame_layout("ans"); }},
+    {"bitcomp_frame_layout", [] { test_nvcomp_frame_layout("bitcomp_sparse"); }},
+    {"deflate_frame_layout", [] { test_nvcomp_frame_layout("deflate"); }},
+    {"lz4_frame_layout", [] { test_nvcomp_frame_layout("lz4"); }},
+#if NVCOMP_VER_MAJOR < 6
+    {"cascaded_frame_layout", [] { test_nvcomp_frame_layout("nvcomp_cascaded_1D1R1B"); }},
+#endif
+    {"multi_column", test_multi_column},
+    {"selective_decompression", test_selective_decompression},
+    {"memory_subset_read", test_memory_subset_read},
+    {"column_names_survive", test_column_names_survive},
+    {"zero_rows", test_zero_rows},
+    {"error_not_found", test_error_not_found},
+    {"error_unknown_edge_channel", test_error_unknown_edge_channel},
+    {"error_garbage", test_error_garbage},
+    {"error_bad_magic", test_error_bad_magic},
+    {"error_bad_version", test_error_bad_version},
+    {"nvcomp_payload_compatibility", test_nvcomp_payload_compatibility},
+    {"nvcomp_reconstruction_metadata", test_nvcomp_reconstruction_metadata},
+    {"identity_string_roundtrip", test_identity_string_roundtrip},
+    {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
+    {"validity_sidecar", test_validity_sidecar_roundtrip},
+    {"validity_header_integrity", test_validity_header_integrity},
+    {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
+    {"decimal128_identity", test_decimal128_identity_roundtrip},
+    {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
+    {"measured_encode_roundtrip", test_measured_encode_roundtrip},
+  };
+
+  int failures = 0;
+  for (auto const& c : cases) {
+    try {
+      c.fn();
+      std::printf("  PASS  %s\n", c.name);
+    } catch (std::exception const& e) {
+      std::fprintf(stderr, "  FAIL  %s: %s\n", c.name, e.what());
+      ++failures;
+    }
+  }
+
+  if (failures == 0) {
+    std::printf("test_compressed_table_io: PASS (%zu cases)\n", sizeof(cases) / sizeof(cases[0]));
+    return 0;
+  }
+  std::fprintf(stderr,
+               "test_compressed_table_io: FAIL (%d/%zu cases failed)\n",
+               failures,
+               sizeof(cases) / sizeof(cases[0]));
+  return 1;
+}

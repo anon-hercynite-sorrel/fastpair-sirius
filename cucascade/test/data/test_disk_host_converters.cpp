@@ -1,0 +1,767 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "utils/cudf_test_utils.hpp"
+#include "utils/mock_test_utils.hpp"
+
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/representation_converter.hpp>
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <catch2/catch_all.hpp>
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+using namespace cucascade;
+
+namespace {
+
+/// Shared memory spaces — reused across all tests to avoid cumulative CUDA context
+/// degradation from repeated creation/destruction of CUDA stream pools and pinned memory.
+auto& shared_gpu_space()
+{
+  static auto s = test::make_mock_memory_space(memory::Tier::GPU, 0);
+  return s;
+}
+auto& shared_host_space()
+{
+  static auto s = test::make_mock_memory_space(memory::Tier::HOST, 0);
+  return s;
+}
+auto& shared_disk_space()
+{
+  static auto s = test::make_mock_memory_space(memory::Tier::DISK, 0);
+  return s;
+}
+::cuda::stream_ref shared_stream()
+{
+  static rmm::cuda_stream s;
+  return s;
+}
+
+/// Round-trip test helper: GPU -> host_data -> disk -> host_data -> GPU, compare tables.
+void round_trip_test(std::unique_ptr<cudf::table> original_table)
+{
+  auto stream      = shared_stream();
+  auto& gpu_space  = shared_gpu_space();
+  auto& host_space = shared_host_space();
+  auto& disk_space = shared_disk_space();
+
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  // Create GPU representation from the original table
+  auto gpu_rep = std::make_unique<gpu_table_representation>(
+    std::move(original_table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  // GPU -> host_data
+  auto host_rep =
+    registry.convert<host_data_representation>(*gpu_rep, host_space.get(), shared_stream());
+
+  // host_data -> disk
+  auto disk_rep =
+    registry.convert<disk_data_representation>(*host_rep, disk_space.get(), shared_stream());
+
+  // disk -> host_data
+  auto host_rep2 =
+    registry.convert<host_data_representation>(*disk_rep, host_space.get(), shared_stream());
+
+  // host_data -> GPU
+  auto gpu_rep2 =
+    registry.convert<gpu_table_representation>(*host_rep2, gpu_space.get(), shared_stream());
+
+  // Compare original (from gpu_rep) with round-tripped
+  test::expect_cudf_tables_equal_on_stream(
+    gpu_rep->get_table_view(), gpu_rep2->get_table_view(), shared_stream());
+}
+
+/// Create a simple column of the given type with uninitialized data.
+/// Returns a single-column cudf::table.
+std::unique_ptr<cudf::table> make_typed_table(cudf::type_id type, cudf::size_type num_rows)
+{
+  auto const dtype = cudf::data_type{type};
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  if (cudf::is_numeric(dtype)) {
+    // cudf::is_numeric includes BOOL8
+    auto col =
+      cudf::make_numeric_column(dtype, num_rows, cudf::mask_state::UNALLOCATED, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_timestamp(dtype)) {
+    auto col =
+      cudf::make_timestamp_column(dtype, num_rows, cudf::mask_state::UNALLOCATED, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_duration(dtype)) {
+    auto col =
+      cudf::make_duration_column(dtype, num_rows, cudf::mask_state::UNALLOCATED, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_fixed_point(dtype)) {
+    auto const fp_dtype = cudf::data_type{type, -2};  // scale = -2
+    auto col            = cudf::make_fixed_point_column(
+      fp_dtype, num_rows, cudf::mask_state::UNALLOCATED, shared_stream());
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Create a table with ALL_NULL mask.
+std::unique_ptr<cudf::table> make_typed_table_with_nulls(cudf::type_id type,
+                                                         cudf::size_type num_rows)
+{
+  auto const dtype = cudf::data_type{type};
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  if (cudf::is_numeric(dtype)) {
+    auto col =
+      cudf::make_numeric_column(dtype, num_rows, cudf::mask_state::ALL_NULL, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_timestamp(dtype)) {
+    auto col =
+      cudf::make_timestamp_column(dtype, num_rows, cudf::mask_state::ALL_NULL, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_duration(dtype)) {
+    auto col =
+      cudf::make_duration_column(dtype, num_rows, cudf::mask_state::ALL_NULL, shared_stream());
+    cols.push_back(std::move(col));
+  } else if (cudf::is_fixed_point(dtype)) {
+    auto const fp_dtype = cudf::data_type{type, -2};
+    auto col            = cudf::make_fixed_point_column(
+      fp_dtype, num_rows, cudf::mask_state::ALL_NULL, shared_stream());
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+}  // namespace
+
+// =============================================================================
+// Numeric type round-trip tests (TEST-01)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip numeric types", "[disk][converter][numeric]")
+{
+  auto type = GENERATE(cudf::type_id::INT8,
+                       cudf::type_id::INT16,
+                       cudf::type_id::INT32,
+                       cudf::type_id::INT64,
+                       cudf::type_id::UINT8,
+                       cudf::type_id::UINT16,
+                       cudf::type_id::UINT32,
+                       cudf::type_id::UINT64,
+                       cudf::type_id::FLOAT32,
+                       cudf::type_id::FLOAT64);
+
+  SECTION("100 rows") { round_trip_test(make_typed_table(type, 100)); }
+}
+
+// =============================================================================
+// BOOL8 round-trip tests (TEST-02)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip bool type", "[disk][converter][bool]")
+{
+  round_trip_test(make_typed_table(cudf::type_id::BOOL8, 100));
+}
+
+// =============================================================================
+// Timestamp round-trip tests (TEST-02)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip timestamp types", "[disk][converter][timestamp]")
+{
+  auto type = GENERATE(cudf::type_id::TIMESTAMP_DAYS,
+                       cudf::type_id::TIMESTAMP_SECONDS,
+                       cudf::type_id::TIMESTAMP_MILLISECONDS,
+                       cudf::type_id::TIMESTAMP_MICROSECONDS,
+                       cudf::type_id::TIMESTAMP_NANOSECONDS);
+
+  round_trip_test(make_typed_table(type, 100));
+}
+
+// =============================================================================
+// Duration round-trip tests (TEST-02)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip duration types", "[disk][converter][duration]")
+{
+  auto type = GENERATE(cudf::type_id::DURATION_DAYS,
+                       cudf::type_id::DURATION_SECONDS,
+                       cudf::type_id::DURATION_MILLISECONDS,
+                       cudf::type_id::DURATION_MICROSECONDS,
+                       cudf::type_id::DURATION_NANOSECONDS);
+
+  round_trip_test(make_typed_table(type, 100));
+}
+
+// =============================================================================
+// Decimal round-trip tests (TEST-03)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip decimal types", "[disk][converter][decimal]")
+{
+  auto type =
+    GENERATE(cudf::type_id::DECIMAL32, cudf::type_id::DECIMAL64, cudf::type_id::DECIMAL128);
+
+  round_trip_test(make_typed_table(type, 100));
+}
+
+// =============================================================================
+// Null mask round-trip tests (TEST-08)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip all-null column", "[disk][converter][null]")
+{
+  round_trip_test(make_typed_table_with_nulls(cudf::type_id::INT32, 100));
+}
+
+TEST_CASE("host_data disk round-trip no-null column", "[disk][converter][null]")
+{
+  round_trip_test(make_typed_table(cudf::type_id::INT32, 100));
+}
+
+TEST_CASE("host_data disk round-trip mixed-null column", "[disk][converter][null]")
+{
+  // Exercise masks beyond the first quarter of the allocation, including a partial word.
+  auto const num_rows = GENERATE(100, 4097);
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, shared_stream());
+
+  // Set every other bit to null using cudf utilities
+  std::vector<cudf::bitmask_type> host_mask(
+    cudf::bitmask_allocation_size_bytes(num_rows) / sizeof(cudf::bitmask_type),
+    ~cudf::bitmask_type{0});
+  // Clear every other bit (set elements 0, 2, 4, ... to null)
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
+  for (int i = 0; i < num_rows; i += 2) {
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
+  }
+  auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
+  col->set_null_mask(std::move(dev_mask), (num_rows + 1) / 2);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// =============================================================================
+// STRING column round-trip tests (TEST-04)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip string column", "[disk][converter][string]")
+{
+  std::vector<std::string> host_strings = {"hello", "", "world", "test123", "", "a"};
+  auto const num_strings                = static_cast<cudf::size_type>(host_strings.size());
+
+  // Compute offsets
+  std::vector<int32_t> host_offsets(static_cast<std::size_t>(num_strings) + 1);
+  host_offsets[0] = 0;
+  for (std::size_t i = 0; i < host_strings.size(); ++i) {
+    host_offsets[i + 1] = host_offsets[i] + static_cast<int32_t>(host_strings[i].size());
+  }
+  auto const total_chars = static_cast<std::size_t>(host_offsets.back());
+
+  // Concatenate all chars
+  std::vector<char> host_chars;
+  host_chars.reserve(total_chars);
+  for (const auto& s : host_strings) {
+    host_chars.insert(host_chars.end(), s.begin(), s.end());
+  }
+
+  // Create device buffers
+  rmm::device_buffer dev_chars(host_chars.data(), host_chars.size(), shared_stream());
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_strings + 1,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                                     host_offsets.data(),
+                                     host_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+  shared_stream().sync();
+
+  auto str_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(dev_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(str_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// Regression: cudf::make_empty_column(STRING) returns a 0-row strings column with no children.
+// plan_column_copy faithfully records 0 children, and reconstruct_column previously rejected
+// that metadata. Empty-string batches show up in real pipelines (e.g. probe-side partition
+// outputs after a filter), get downgraded to host under memory pressure, and crash on
+// upgrade back to GPU.
+TEST_CASE("host_data disk round-trip empty strings column", "[disk][converter][string][empty]")
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip empty strings column mixed with non-empty column",
+          "[disk][converter][string][empty]")
+{
+  // Mimic the in-pipeline shape: a 0-row table where one of the columns is an empty STRING.
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip string column with nulls", "[disk][converter][string][null]")
+{
+  std::vector<std::string> host_strings = {"alpha", "beta", "gamma", "delta"};
+  auto const num_strings                = static_cast<cudf::size_type>(host_strings.size());
+
+  std::vector<int32_t> host_offsets(static_cast<std::size_t>(num_strings) + 1);
+  host_offsets[0] = 0;
+  for (std::size_t i = 0; i < host_strings.size(); ++i) {
+    host_offsets[i + 1] = host_offsets[i] + static_cast<int32_t>(host_strings[i].size());
+  }
+
+  std::vector<char> host_chars;
+  for (const auto& s : host_strings) {
+    host_chars.insert(host_chars.end(), s.begin(), s.end());
+  }
+
+  rmm::device_buffer dev_chars(host_chars.data(), host_chars.size(), shared_stream());
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_strings + 1,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                                     host_offsets.data(),
+                                     host_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  // Create null mask: elements 1 and 3 are null
+  auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_strings);
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 1);  // null at index 1
+  host_mask[0] &= ~(cudf::bitmask_type{1} << 3);  // null at index 3
+  auto dev_mask = test::make_null_mask_from_host(num_strings, host_mask, shared_stream());
+  shared_stream().sync();
+
+  auto str_col = cudf::make_strings_column(
+    num_strings, std::move(offsets_col), std::move(dev_chars), 2, std::move(dev_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(str_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// =============================================================================
+// LIST column round-trip tests (TEST-05)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip list column", "[disk][converter][list]")
+{
+  // LIST<INT32> column
+
+  // Create offsets: [0, 2, 5, 5, 8] -> 4 lists with lengths [2, 3, 0, 3]
+  std::vector<int32_t> host_offsets = {0, 2, 5, 5, 8};
+  auto const num_lists              = static_cast<cudf::size_type>(host_offsets.size() - 1);
+
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_lists + 1,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                                     host_offsets.data(),
+                                     host_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  // Create values child: 8 INT32 values
+  auto values_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 8, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  shared_stream().sync();
+
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(list_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip nested list column", "[disk][converter][list][nested]")
+{
+  // LIST<LIST<INT32>> column
+
+  // Inner lists: offsets [0, 2, 3] -> 2 inner lists
+  std::vector<int32_t> inner_offsets = {0, 2, 3};
+  auto inner_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(inner_offsets_col->mutable_view().data<int32_t>(),
+                                     inner_offsets.data(),
+                                     inner_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  auto inner_values = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  auto inner_list =
+    cudf::make_lists_column(2,
+                            std::move(inner_offsets_col),
+                            std::move(inner_values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  // Outer lists: offsets [0, 1, 2] -> 2 outer lists, each containing 1 inner list
+  std::vector<int32_t> outer_offsets = {0, 1, 2};
+  auto outer_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(outer_offsets_col->mutable_view().data<int32_t>(),
+                                     outer_offsets.data(),
+                                     outer_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  shared_stream().sync();
+
+  auto outer_list =
+    cudf::make_lists_column(2,
+                            std::move(outer_offsets_col),
+                            std::move(inner_list),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(outer_list));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip nullable list column", "[disk][converter][list][nullable]")
+{
+  // LIST<INT32> with a null list. Offsets [0, 2, 5, 5, 8] -> 4 lists, lengths [2, 3, 0, 3].
+  // Mark list index 2 (the empty [5,5) range) as null so the null row stays empty and the
+  // original column is well-formed. Exercises the null_count > 0 H2D reconstruction path.
+  std::vector<int32_t> host_offsets = {0, 2, 5, 5, 8};
+  auto const num_lists              = static_cast<cudf::size_type>(host_offsets.size() - 1);
+
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_lists + 1,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                                     host_offsets.data(),
+                                     host_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  auto values_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 8, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  // Null mask: all lists valid except index 2.
+  auto null_mask = cudf::create_null_mask(num_lists, cudf::mask_state::ALL_VALID, shared_stream());
+  cudf::set_null_mask(
+    reinterpret_cast<cudf::bitmask_type*>(null_mask.data()), 2, 3, false, shared_stream());
+
+  shared_stream().sync();
+
+  auto list_col = cudf::make_lists_column(
+    num_lists, std::move(offsets_col), std::move(values_col), 1, std::move(null_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(list_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip nullable nested list column",
+          "[disk][converter][list][nested][nullable]")
+{
+  // LIST<LIST<INT32>> with a null outer list. Inner: offsets [0, 2, 3] -> 2 inner lists
+  // (lengths 2, 1) over 3 values. Outer: offsets [0, 2, 2] -> outer list 0 holds both inner
+  // lists, outer list 1 is the empty [2,2) range and is marked null. Exercises reconstruction
+  // recursion through a null mask.
+  std::vector<int32_t> inner_offsets = {0, 2, 3};
+  auto inner_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(inner_offsets_col->mutable_view().data<int32_t>(),
+                                     inner_offsets.data(),
+                                     inner_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  auto inner_values = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+
+  auto inner_list =
+    cudf::make_lists_column(2,
+                            std::move(inner_offsets_col),
+                            std::move(inner_values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  // Outer lists: offsets [0, 2, 2] -> list 0 holds both inner lists, list 1 is empty (and null).
+  std::vector<int32_t> outer_offsets = {0, 2, 2};
+  auto outer_offsets_col             = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 3, cudf::mask_state::UNALLOCATED, shared_stream());
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(outer_offsets_col->mutable_view().data<int32_t>(),
+                                     outer_offsets.data(),
+                                     outer_offsets.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice,
+                                     shared_stream().get()));
+
+  // Outer null mask: outer list index 1 is null.
+  auto outer_null_mask = cudf::create_null_mask(2, cudf::mask_state::ALL_VALID, shared_stream());
+  cudf::set_null_mask(
+    reinterpret_cast<cudf::bitmask_type*>(outer_null_mask.data()), 1, 2, false, shared_stream());
+
+  shared_stream().sync();
+
+  auto outer_list = cudf::make_lists_column(
+    2, std::move(outer_offsets_col), std::move(inner_list), 1, std::move(outer_null_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(outer_list));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// =============================================================================
+// STRUCT column round-trip tests (TEST-06)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip struct column", "[disk][converter][struct]")
+{
+  // STRUCT<INT32, FLOAT64>
+
+  auto const num_rows = cudf::size_type{50};
+
+  auto int_child   = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                             num_rows,
+                                             cudf::mask_state::UNALLOCATED,
+                                             shared_stream());
+  auto float_child = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                               num_rows,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(int_child));
+  children.push_back(std::move(float_child));
+
+  auto struct_col = cudf::make_structs_column(
+    num_rows, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(struct_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip nested struct column", "[disk][converter][struct][nested]")
+{
+  // STRUCT<STRUCT<INT32>>
+
+  auto const num_rows = cudf::size_type{30};
+
+  auto inner_child = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               num_rows,
+                                               cudf::mask_state::UNALLOCATED,
+                                               shared_stream());
+
+  std::vector<std::unique_ptr<cudf::column>> inner_children;
+  inner_children.push_back(std::move(inner_child));
+  auto inner_struct =
+    cudf::make_structs_column(num_rows,
+                              std::move(inner_children),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> outer_children;
+  outer_children.push_back(std::move(inner_struct));
+  auto outer_struct =
+    cudf::make_structs_column(num_rows,
+                              std::move(outer_children),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(outer_struct));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+TEST_CASE("host_data disk round-trip struct with null mask", "[disk][converter][struct][null]")
+{
+  // STRUCT<INT32> with struct-level null mask
+
+  auto const num_rows = cudf::size_type{40};
+
+  auto child = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                         num_rows,
+                                         cudf::mask_state::UNALLOCATED,
+                                         shared_stream());
+
+  // Create struct-level null mask (every 3rd element is null)
+  auto null_mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
+  for (int i = 0; i < num_rows; i += 3) {
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
+    null_count++;
+  }
+  auto dev_mask = test::make_null_mask_from_host(num_rows, host_mask, shared_stream());
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(child));
+
+  shared_stream().sync();
+  auto struct_col =
+    cudf::make_structs_column(num_rows, std::move(children), null_count, std::move(dev_mask));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(struct_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// =============================================================================
+// DICTIONARY column round-trip tests (TEST-07)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip dictionary column", "[disk][converter][dictionary]")
+{
+  // DICTIONARY32 with INT32 keys
+
+  auto const num_rows = cudf::size_type{50};
+  auto const num_keys = cudf::size_type{5};
+
+  // Keys: 5 unique INT32 values
+  auto keys = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                        num_keys,
+                                        cudf::mask_state::UNALLOCATED,
+                                        shared_stream());
+
+  // Indices: INT32 values in [0, num_keys)
+  auto indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           num_rows,
+                                           cudf::mask_state::UNALLOCATED,
+                                           shared_stream());
+
+  shared_stream().sync();
+
+  auto dict_col = cudf::make_dictionary_column(std::move(keys), std::move(indices));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(dict_col));
+  round_trip_test(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+// =============================================================================
+// Sliced column round-trip tests (TEST-09)
+// =============================================================================
+
+TEST_CASE("host_data disk round-trip sliced column", "[disk][converter][sliced]")
+{
+  // Create a column, slice it, compact it, then round-trip
+
+  auto const total_rows  = cudf::size_type{200};
+  auto const slice_start = cudf::size_type{50};
+  auto const slice_end   = cudf::size_type{150};
+
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       total_rows,
+                                       cudf::mask_state::ALL_VALID,
+                                       shared_stream());
+
+  std::vector<std::unique_ptr<cudf::column>> table_cols;
+  table_cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(table_cols));
+
+  // Slice to get a view with non-zero offset
+  auto sliced_views = cudf::slice(table->view(), {slice_start, slice_end});
+  REQUIRE(sliced_views.size() == 1);
+  REQUIRE(sliced_views[0].num_rows() == slice_end - slice_start);
+
+  // Compact the slice into a new table (removes offset)
+  auto compacted = std::make_unique<cudf::table>(sliced_views[0], shared_stream());
+  REQUIRE(compacted->num_rows() == slice_end - slice_start);
+
+  round_trip_test(std::move(compacted));
+}
+
+TEST_CASE("host_data disk round-trip sliced column with nulls", "[disk][converter][sliced][null]")
+{
+  auto const total_rows = cudf::size_type{200};
+
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       total_rows,
+                                       cudf::mask_state::ALL_VALID,
+                                       shared_stream());
+
+  // Set some nulls
+  auto null_mask_size = cudf::bitmask_allocation_size_bytes(total_rows);
+  std::vector<cudf::bitmask_type> host_mask(null_mask_size / sizeof(cudf::bitmask_type),
+                                            ~cudf::bitmask_type{0});
+  cudf::size_type null_count   = 0;
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
+  for (int i = 0; i < total_rows; i += 5) {
+    auto word_idx = static_cast<std::size_t>(i) / bits_per_word;
+    auto bit_idx  = static_cast<std::size_t>(i) % bits_per_word;
+    host_mask[word_idx] &= ~(cudf::bitmask_type{1} << bit_idx);
+    null_count++;
+  }
+  auto dev_mask = test::make_null_mask_from_host(total_rows, host_mask, shared_stream());
+  col->set_null_mask(std::move(dev_mask), null_count);
+
+  std::vector<std::unique_ptr<cudf::column>> table_cols;
+  table_cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(table_cols));
+
+  // Slice middle portion
+  auto sliced_views = cudf::slice(table->view(), {cudf::size_type{50}, cudf::size_type{150}});
+  shared_stream().sync();
+  auto compacted = std::make_unique<cudf::table>(sliced_views[0], shared_stream());
+
+  round_trip_test(std::move(compacted));
+}

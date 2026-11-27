@@ -1,0 +1,392 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// What a scan must still evaluate after the decode, given what the decode says
+// it did. Three outcomes per conjunct, and getting them wrong is silent:
+//   * the decode did nothing with it       -> keep the comparison
+//   * the decode ANSWERED it (BOOL8 in the column, rows untouched)
+//                                          -> reference the answer; re-running
+//                                             the comparison would test a mask
+//                                             against the original constant
+//   * the decode APPLIED it (folded into the row selection)
+//                                          -> drop it; the surviving rows
+//                                             already satisfy it
+//
+// The last case is reachable only when the filtered decode applies with an
+// equality source, which the default thresholds decline for the sizes the
+// end-to-end tests use — so it is pinned here, where the decision is made,
+// rather than left to a configuration that happens to reach it.
+
+#include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/scan_execution_record.hpp"
+#include "op/scan/scan_filter_analysis.hpp"
+
+#include <catch.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+#include <cstddef>
+#include <utility>
+#include <vector>
+
+using namespace sirius::op;
+
+namespace {
+
+/// `column[batch_position] = 'x'`, the shape a pure-filter string column's
+/// conjunct takes.
+table_filter_conjunct string_equality(std::size_t primary_index, std::size_t batch_position)
+{
+  auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+    duckdb::LogicalType::VARCHAR, static_cast<duckdb::idx_t>(batch_position));
+  auto constant =
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value("DELIVER IN PERSON"));
+  return {primary_index,
+          batch_position,
+          duckdb::BoundComparisonExpression::Create(
+            duckdb::ExpressionType::COMPARE_EQUAL, std::move(column), std::move(constant))};
+}
+
+table_filter_conjunct numeric_multi_column(std::size_t left, std::size_t right)
+{
+  auto lhs = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
+                                                                 static_cast<duckdb::idx_t>(left));
+  auto rhs = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
+                                                                 static_cast<duckdb::idx_t>(right));
+  return {0,
+          std::nullopt,
+          duckdb::BoundComparisonExpression::Create(
+            duckdb::ExpressionType::COMPARE_LESSTHAN, std::move(lhs), std::move(rhs))};
+}
+
+std::vector<table_filter_conjunct> two_conjuncts()
+{
+  std::vector<table_filter_conjunct> conjuncts;
+  conjuncts.push_back(string_equality(/*primary_index=*/7, /*batch_position=*/1));
+  conjuncts.push_back(string_equality(/*primary_index=*/9, /*batch_position=*/2));
+  return conjuncts;
+}
+
+}  // namespace
+
+TEST_CASE("residual_filter keeps every conjunct when the decode answered nothing", "[scan]")
+{
+  residual_filter const residual{two_conjuncts(), /*answerable_batch_positions=*/{1, 2}};
+  REQUIRE_FALSE(residual.empty());
+
+  auto const predicate = residual.against(/*answered_positions=*/{});
+  REQUIRE(predicate != nullptr);
+  REQUIRE(predicate->holds<sirius::ast::conjunction>());
+  auto const& all = predicate->get<sirius::ast::conjunction>();
+  REQUIRE(all.op == sirius::ast::conjunction::kind::op_and);
+  REQUIRE(all.children.size() == 2);
+  // Both still comparisons — nothing was answered, so nothing may be referenced.
+  REQUIRE(all.children[0]->holds<sirius::ast::comparison>());
+  REQUIRE(all.children[1]->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("residual_filter references an answered conjunct's column", "[scan]")
+{
+  residual_filter const residual{two_conjuncts(), {1, 2}};
+
+  auto const predicate = residual.against(/*answered_positions=*/{1});
+  REQUIRE(predicate != nullptr);
+  auto const& all = predicate->get<sirius::ast::conjunction>();
+  REQUIRE(all.children.size() == 2);
+  // The answered column IS the conjunct's truth value, read as a boolean.
+  REQUIRE(all.children[0]->holds<sirius::ast::reference>());
+  auto const& ref = all.children[0]->get<sirius::ast::reference>();
+  REQUIRE(ref.column_index == 1);
+  REQUIRE(ref.return_type().id() == sirius::type_id::BOOLEAN);
+  REQUIRE(all.children[1]->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("residual_filter drops a conjunct the decode applied to the rows", "[scan]")
+{
+  residual_filter const residual{two_conjuncts(), {1, 2}};
+
+  auto const predicate = residual.against(/*answered_positions=*/{1}, /*answers_enforced=*/true);
+  REQUIRE(predicate != nullptr);
+  // One conjunct left, so no conjunction wrapper — and it is the OTHER column's
+  // comparison, not a reference to the applied one.
+  REQUIRE(predicate->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("residual_filter is empty when the decode applied every conjunct", "[scan]")
+{
+  residual_filter const residual{two_conjuncts(), {1, 2}};
+
+  // Null means "already filtered", NOT "no filtering needed" — the caller must
+  // mark the batch row-filtered rather than pass the rows through unfiltered.
+  REQUIRE(residual.against({1, 2}, /*answers_enforced=*/true) == nullptr);
+  // Without enforcement the same answers only become references: the decode
+  // reported the values, not a smaller row set.
+  auto const answered_only = residual.against({1, 2}, /*answers_enforced=*/false);
+  REQUIRE(answered_only != nullptr);
+  REQUIRE(answered_only->get<sirius::ast::conjunction>().children.size() == 2);
+}
+
+TEST_CASE("residual_filter leaves unanswerable columns alone", "[scan]")
+{
+  // Only position 1 was nominated, so position 2 keeps its comparison however
+  // the decode reports itself — a column the scan never offered cannot have
+  // been answered for it.
+  residual_filter const residual{two_conjuncts(), /*answerable_batch_positions=*/{1}};
+
+  auto const predicate = residual.against({1, 2}, /*answers_enforced=*/true);
+  REQUIRE(predicate != nullptr);
+  REQUIRE(predicate->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("Legacy execution translation preserves independent facts", "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1, 2}};
+  auto const state               = GENERATE(filter_state::UNFILTERED,
+                              filter_state::ROWGROUP_FILTERED,
+                              filter_state::ROW_FILTERED,
+                              filter_state::ROW_FILTERED_AND_PROJECTED);
+  bool const answers             = GENERATE(false, true);
+  bool const enforced            = GENERATE(false, true);
+  bool const observed_row_filter = GENERATE(false, true);
+  std::vector<std::size_t> columns =
+    answers ? std::vector<std::size_t>{1} : std::vector<std::size_t>{};
+  auto record =
+    translate_legacy_execution({state, columns, enforced, observed_row_filter}, catalogue, 17, 3);
+  REQUIRE_NOTHROW(validate_execution_record(record, catalogue, 17, 3));
+  CHECK_FALSE(record.authoritative);
+  CHECK(record.positions == row_position_state::none);
+  CHECK_FALSE(record.visibility_complete);
+  CHECK(record.visibility_applied.empty());
+  CHECK(record.projection_complete == (state == filter_state::ROW_FILTERED_AND_PROJECTED));
+  CHECK(record.whole_static_complete ==
+        (observed_row_filter || state == filter_state::ROW_FILTERED ||
+         state == filter_state::ROW_FILTERED_AND_PROJECTED));
+  REQUIRE(record.predicates.size() == (answers ? 1 : 0));
+  if (answers) {
+    CHECK(record.predicates.front().conjunct == 0);
+    CHECK(record.predicates.front().answer_slot == 1);
+    CHECK(record.predicates.front().stage ==
+          (enforced ? predicate_stage::enforced : predicate_stage::answer));
+    auto remaining = catalogue.against_progress(record.predicates);
+    REQUIRE(remaining);
+    // Even an enforced answer for conjunct 0 leaves conjunct 1 pending.
+    CHECK(remaining->holds<sirius::ast::comparison>() == enforced);
+  }
+}
+
+TEST_CASE("Execution records reject foreign bindings and impossible coverage",
+          "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1, 2}};
+  auto record = translate_legacy_execution({filter_state::UNFILTERED, {}, false}, catalogue, 17, 3);
+  SECTION("wrong program") { REQUIRE_THROWS(validate_execution_record(record, catalogue, 18, 3)); }
+  SECTION("wrong generation")
+  {
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 4));
+  }
+  SECTION("duplicate conjunct")
+  {
+    record.predicates = {{0, predicate_stage::enforced, {}}, {0, predicate_stage::enforced, {}}};
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3));
+  }
+  SECTION("wrong answer binding")
+  {
+    record.predicates = {{0, predicate_stage::answer, 2}};
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3));
+  }
+  SECTION("assembled with pending conditions")
+  {
+    record.projection_complete = true;
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3));
+  }
+  SECTION("unoffered answer")
+  {
+    std::vector<std::size_t> answers{3};
+    REQUIRE_THROWS(
+      translate_legacy_execution({filter_state::UNFILTERED, answers, false}, catalogue, 17, 3));
+  }
+}
+
+TEST_CASE("Shadow records cannot change decisions and producer authority is validated",
+          "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1, 2}};
+  legacy_execution_facts legacy{filter_state::UNFILTERED, {}, false};
+  auto shadow   = translate_legacy_execution(legacy, catalogue, 17, 3);
+  auto selected = select_execution_record(&shadow, legacy, catalogue, 17, 3);
+  CHECK_FALSE(selected.used_producer);
+  CHECK_FALSE(selected.shadow_mismatch);
+  shadow.producer   = execution_record_producer::parquet;
+  shadow.predicates = {{0, predicate_stage::enforced, {}}};
+  selected          = select_execution_record(&shadow, legacy, catalogue, 17, 3);
+  CHECK_FALSE(selected.used_producer);
+  CHECK_FALSE(selected.shadow_mismatch);
+  CHECK(selected.shadow_coverage_added);
+  CHECK(selected.facts.predicates.empty());
+  shadow.generation = 99;
+  CHECK(select_execution_record(&shadow, legacy, catalogue, 17, 3).shadow_mismatch);
+  shadow.authoritative = true;
+  REQUIRE_THROWS(select_execution_record(&shadow, legacy, catalogue, 17, 3));
+  shadow.generation = 3;
+  REQUIRE_THROWS(select_execution_record(&shadow, legacy, catalogue, 17, 3));
+  shadow.visibility_complete = true;
+  selected                   = select_execution_record(&shadow, legacy, catalogue, 17, 3);
+  CHECK(selected.used_producer);
+  CHECK_FALSE(selected.shadow_mismatch);
+  REQUIRE(selected.facts.predicates.size() == 1);
+  auto remaining = catalogue.against_progress(selected.facts.predicates);
+  REQUIRE(remaining->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("Invalid legacy answer reports remain observable without changing old authority",
+          "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1}};
+  std::vector<std::size_t> reported{1, 1, 2};
+  auto selected =
+    select_execution_record(nullptr, {filter_state::UNFILTERED, reported, true}, catalogue, 17, 3);
+  CHECK_FALSE(selected.used_producer);
+  CHECK(selected.shadow_mismatch);
+  REQUIRE(selected.facts.predicates.size() == 1);
+  CHECK(selected.facts.predicates.front().conjunct == 0);
+  REQUIRE(catalogue.against_progress(selected.facts.predicates)->holds<sirius::ast::comparison>());
+}
+
+TEST_CASE("Execution records compare independently required visibility and ordered layout",
+          "[scan][execution_record]")
+{
+  using namespace sirius::op::scan;
+  residual_filter const catalogue{two_conjuncts(), {1, 2}};
+  auto set_a = std::make_shared<int const>(1), set_b = std::make_shared<int const>(2);
+  auto layout = std::make_shared<std::vector<int> const>(std::vector<int>{0, 1});
+  visibility_bindings required{{"a", set_a}, {"b", set_b}};
+  execution_requirements requirements{required, layout};
+  auto record = translate_legacy_execution({filter_state::UNFILTERED, {}, false}, catalogue, 17, 3);
+  record.layout              = layout;
+  record.layout_width        = 2;
+  record.visibility_complete = true;
+  record.visibility_applied  = required;
+  SECTION("exact bindings")
+  {
+    REQUIRE_NOTHROW(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("missing set")
+  {
+    record.visibility_applied.pop_back();
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("different set for the same file")
+  {
+    record.visibility_applied[0].input = std::make_shared<int const>(1);
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("wrong file")
+  {
+    record.visibility_applied[0].file = "c";
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("duplicate applied set")
+  {
+    record.visibility_applied.push_back(required.front());
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("same width reordered layout")
+  {
+    record.layout = std::make_shared<std::vector<int> const>(std::vector<int>{1, 0});
+    REQUIRE_THROWS(validate_execution_record(record, catalogue, 17, 3, &requirements));
+  }
+  SECTION("only remaining bindings execute and failed work is not recorded")
+  {
+    record.visibility_applied.resize(1);
+    record.visibility_complete = false;
+    int calls                  = 0;
+    REQUIRE_THROWS(finish_visibility(
+      required, record.visibility_applied, record.visibility_complete, [&](auto pending) {
+        ++calls;
+        REQUIRE(pending.size() == 1);
+        CHECK(pending[0].file == "b");
+        throw std::runtime_error("delete failed");
+      }));
+    CHECK_FALSE(record.visibility_complete);
+    CHECK(record.visibility_applied.size() == 1);
+    auto apply = [&](auto pending) {
+      ++calls;
+      REQUIRE(pending.size() == 1);
+      CHECK(pending[0].input == set_b);
+    };
+    finish_visibility(required, record.visibility_applied, record.visibility_complete, apply);
+    finish_visibility(required, record.visibility_applied, record.visibility_complete, apply);
+    CHECK(calls == 2);
+    CHECK(record.visibility_complete);
+  }
+}
+
+TEST_CASE("Residual combines exact coverage with an unevaluated answer", "[scan][residual_filter]")
+{
+  residual_filter const residual{two_conjuncts(), {1, 2}};
+  std::vector<predicate_progress> progress{{0, predicate_stage::enforced, {}},
+                                           {1, predicate_stage::answer, 2}};
+  auto result = residual.against_progress(progress);
+  REQUIRE(result->holds<sirius::ast::reference>());
+  REQUIRE(result->get<sirius::ast::reference>().column_index == 2);
+  progress[1] = {1, predicate_stage::pruning_only, {}};
+  REQUIRE(residual.against_progress(progress)->holds<sirius::ast::comparison>());
+  progress.push_back({1, predicate_stage::enforced, {}});
+  REQUIRE_THROWS(residual.against_progress(progress));
+  progress = {{2, predicate_stage::enforced, {}}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+  progress = {{0, predicate_stage::answer, 2}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}
+
+TEST_CASE("Residual refuses a lost value needed by another conjunct", "[scan][residual_filter]")
+{
+  auto conjuncts = two_conjuncts();
+  conjuncts.push_back(string_equality(7, 1));
+  residual_filter const residual{std::move(conjuncts), {1, 2}};
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 1}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}
+
+TEST_CASE("Residual keeps a multi-column conjunct when another slot is answered",
+          "[scan][residual_filter]")
+{
+  std::vector<table_filter_conjunct> conjuncts;
+  conjuncts.push_back(string_equality(/*primary_index=*/7, /*batch_position=*/0));
+  conjuncts.push_back(numeric_multi_column(1, 2));
+  residual_filter const residual{std::move(conjuncts), {0, 1, 2}};
+
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 0}};
+  auto const predicate = residual.against_progress(progress);
+  REQUIRE(predicate->holds<sirius::ast::conjunction>());
+  REQUIRE(predicate->get<sirius::ast::conjunction>().children.size() == 2);
+}
+
+TEST_CASE("Residual rejects a multi-column conjunct when a referenced slot is answered",
+          "[scan][residual_filter]")
+{
+  auto conjuncts = two_conjuncts();
+  conjuncts.push_back(numeric_multi_column(1, 2));
+  residual_filter const residual{std::move(conjuncts), {1, 2}};
+
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 2}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}

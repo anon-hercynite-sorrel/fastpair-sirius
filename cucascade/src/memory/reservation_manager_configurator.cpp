@@ -1,0 +1,373 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+
+#include <rmm/cuda_device.hpp>
+
+#include <numa.h>
+
+#include <algorithm>
+#include <memory>
+#include <numeric>
+#include <set>
+#include <stdexcept>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+namespace cucascade {
+namespace memory {
+
+using builder_reference = reservation_manager_configurator::builder_reference;
+
+builder_reference& reservation_manager_configurator::set_number_of_gpus(std::size_t n_gpus)
+{
+  assert(n_gpus > 0 && "Number of GPUs must be positive");
+  _gpu_ids_or_num_gpus = n_gpus;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_gpu_ids(const std::vector<int>& gpu_ids)
+{
+  assert(!gpu_ids.empty() && "GPU IDs vector must not be empty");
+  _gpu_ids_or_num_gpus = gpu_ids;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_gpu_usage_limit(std::size_t bytes)
+{
+  _gpu_capacity = bytes;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_usage_limit_ratio_per_gpu(double fraction)
+{
+  assert(fraction > 0.0 && fraction <= 1.0 && "Usage limit ratio must be in (0.0, 1.0]");
+  _gpu_capacity = fraction;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_reservation_limit_per_gpu(size_t bytes)
+{
+  _gpu_reservation = bytes;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_reservation_fraction_per_gpu(
+  double fraction)
+{
+  assert(fraction > 0.0 && fraction <= 1.0 && "Reservation limit ratio must be in (0.0, 1.0]");
+  _gpu_reservation = fraction;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_downgrade_fractions_per_gpu(double start,
+                                                                                     double end)
+{
+  assert(start > 0.0 && start <= 1.0 && "Start fraction must be in (0.0, 1.0]");
+  assert(end > 0.0 && end <= 1.0 && "End fraction must be in (0.0, 1.0]");
+  downgrade_fractions_per_gpu_ = {start, end};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::track_reservation_per_stream(bool enable)
+{
+  _per_stream_gpu_reservation = enable;
+  return *this;
+}
+
+// --- cpu / numa region settings ---
+
+builder_reference& reservation_manager_configurator::use_gpu_id_as_host_id()
+{
+  _host_id_policy = bind_host_id_to_gpu_id{};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::use_numa_id_as_host_id()
+{
+  _host_id_policy = bind_host_id_to_numa_id{};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_total_host_capacity(std::size_t bytes)
+{
+  assert(bytes > 0 && "Total NUMA region capacity must be positive");
+  _numa_region_capacity  = bytes;
+  _is_capacity_per_space = false;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_per_numa_region_capacity(std::size_t bytes)
+{
+  assert(bytes > 0 && "Capacity per NUMA region must be positive");
+  _numa_region_capacity  = bytes;
+  _is_capacity_per_space = true;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_usage_limit_ratio_per_numa_region(
+  double fraction)
+{
+  assert(fraction > 0.0 && fraction <= 1.0 && "Usage limit ratio must be in (0.0, 1.0]");
+  _numa_region_capacity  = fraction;
+  _is_capacity_per_space = true;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_downgrade_fractions_per_numa_region(
+  double start, double end)
+{
+  assert(start > 0.0 && start <= 1.0 && "Start fraction must be in (0.0, 1.0]");
+  assert(end > 0.0 && end <= 1.0 && "End fraction must be in (0.0, 1.0]");
+  downgrade_fractions_per_numa_region_ = {start, end};
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_reservation_fraction_per_numa_region(
+  double fraction)
+{
+  assert(fraction > 0.0 && fraction <= 1.0 && "Reservation limit ratio must be in (0.0, 1.0]");
+  _cpu_reservation = fraction;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_reservation_limit_per_numa_region(
+  size_t bytes)
+{
+  _cpu_reservation = bytes;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_host_pool_features(
+  size_t chunk_size, size_t block_size, size_t initial_block_count)
+{
+  assert(chunk_size > 0 && "Chunk size must be positive");
+  assert(block_size > 0 && "Block size must be positive");
+  assert(initial_block_count > 0 && "Initial block count must be positive");
+  this->chunk_size          = chunk_size;
+  this->block_size          = block_size;
+  this->initial_block_count = initial_block_count;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_gpu_memory_resource_factory(
+  DeviceMemoryResourceFactoryFn mr_fn)
+{
+  assert(mr_fn && "GPU memory resource factory cannot be nullptr");
+  _gpu_mr_fn = std::move(mr_fn);
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_host_memory_resource_factory(
+  DeviceMemoryResourceFactoryFn mr_fn)
+{
+  assert(mr_fn && "CPU memory resource factory cannot be nullptr");
+  _cpu_mr_fn = std::move(mr_fn);
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_host_portability(bool make_portable)
+{
+  _host_memory_portability = make_portable;
+  return *this;
+}
+
+builder_reference& reservation_manager_configurator::set_disk_mounting_point(
+  int uuid, std::size_t capacity, std::string mounting_point)
+{
+  assert(!mounting_point.empty() && "Mounting point cannot be empty");
+  _disk_mounting_points.emplace_back(uuid, capacity, std::move(mounting_point));
+  return *this;
+}
+
+std::vector<memory_space_config> reservation_manager_configurator::build() const
+{
+  topology_discovery discovery;
+  [[maybe_unused]] bool status = discovery.discover();
+  assert(status);
+  auto& topology = discovery.get_topology();
+  return build(topology);
+}
+
+std::vector<memory_space_config> reservation_manager_configurator::build(
+  const system_topology_info& topology) const
+{
+  auto gpus_info                = extract_gpu_ids(topology);
+  auto numa_region_infos        = extract_numa_region_ids(gpus_info, topology);
+  bool const make_host_portable = _host_memory_portability.value_or(gpus_info.size() > 1);
+
+  std::vector<memory_space_config> configs;
+  for (auto& info : gpus_info) {
+    gpu_memory_space_config config;
+    config.device_id       = info.space_id;
+    config.memory_capacity = _gpu_capacity.get_capacity(info.gpu_capacity);
+    config.mr_factory_fn =
+      (info.space_id == info.hw_id)
+        ? _gpu_mr_fn
+        : [current_mr_fn = _gpu_mr_fn, hw_id = info.hw_id](
+            int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
+      return current_mr_fn(hw_id, capacity);
+    };
+    config.reservation_limit_fraction = _gpu_reservation.get_fraction(info.gpu_capacity);
+    config.downgrade_trigger_fraction = downgrade_fractions_per_gpu_.first;
+    config.downgrade_stop_fraction    = downgrade_fractions_per_gpu_.second;
+    config.per_stream_reservation     = _per_stream_gpu_reservation;
+    configs.emplace_back(config);
+  };
+
+  // Absolute capacities are either per-space or split evenly across spaces; a fraction is
+  // always relative to the capacity of the NUMA region backing the space.
+  auto numa_region_capacity_of = [&](const numa_region_info& info) -> std::size_t {
+    if (_numa_region_capacity.holds_fraction()) {
+      if (info.is_device_memory) {
+        throw std::runtime_error("NUMA region capacity fraction requested but NUMA node " +
+                                 std::to_string(info.numa_id) +
+                                 " is device memory, not host memory; size this space with "
+                                 "set_per_numa_region_capacity() instead");
+      }
+      if (!info.numa_capacity.has_value()) {
+        throw std::runtime_error(
+          "NUMA region capacity fraction requested but the memory capacity of NUMA node " +
+          std::to_string(info.numa_id) + " is unknown");
+      }
+      return _numa_region_capacity.get_capacity(*info.numa_capacity);
+    }
+    auto const bytes = _numa_region_capacity.get_size();
+    return (_is_capacity_per_space || numa_region_infos.size() <= 1)
+             ? bytes
+             : bytes / numa_region_infos.size();
+  };
+
+  for (auto& info : numa_region_infos) {
+    size_t const per_numa_region_capacity = numa_region_capacity_of(info);
+
+    host_memory_space_config config;
+    config.numa_id         = info.space_id;
+    config.memory_capacity = per_numa_region_capacity;
+    config.make_portable   = make_host_portable;
+    DeviceMemoryResourceFactoryFn host_mr_fn =
+      [current_mr_fn = _cpu_mr_fn, numa_id = info.numa_id, make_host_portable](
+        int, size_t capacity) -> cuda::mr::any_resource<cuda::mr::device_accessible> {
+      if (current_mr_fn) { return current_mr_fn(numa_id, capacity); }
+      return make_default_host_memory_resource(numa_id, capacity, make_host_portable);
+    };
+    config.mr_factory_fn              = std::move(host_mr_fn);
+    config.reservation_limit_fraction = _cpu_reservation.get_fraction(per_numa_region_capacity);
+    config.downgrade_trigger_fraction = downgrade_fractions_per_numa_region_.first;
+    config.downgrade_stop_fraction    = downgrade_fractions_per_numa_region_.second;
+    config.block_size                 = chunk_size.value_or(memory::default_block_size);
+    config.pool_size                  = block_size.value_or(memory::default_pool_size);
+    config.initial_number_pools =
+      initial_block_count.value_or(memory::default_initial_number_pools);
+    configs.emplace_back(config);
+  }
+
+  for (auto dinfo : _disk_mounting_points) {
+    disk_memory_space_config config;
+    config.disk_id         = std::get<int>(dinfo);
+    config.mount_paths     = std::get<std::string>(dinfo);
+    config.memory_capacity = std::get<std::size_t>(dinfo);
+    configs.emplace_back(config);
+  }
+
+  return configs;
+}
+
+std::vector<reservation_manager_configurator::gpu_info>
+reservation_manager_configurator::extract_gpu_ids(const system_topology_info& topology) const
+{
+  size_t num_gpus = 0;
+  std::vector<int> gpu_ids;
+  if (std::holds_alternative<std::vector<int>>(_gpu_ids_or_num_gpus)) {
+    num_gpus = std::get<std::vector<int>>(_gpu_ids_or_num_gpus).size();
+    gpu_ids  = std::get<std::vector<int>>(_gpu_ids_or_num_gpus);
+  } else {
+    num_gpus = std::get<std::size_t>(_gpu_ids_or_num_gpus);
+    gpu_ids.resize(num_gpus);
+    std::iota(gpu_ids.begin(), gpu_ids.end(), 0);
+  }
+
+  if (num_gpus > topology.gpus.size()) {
+    throw std::runtime_error("Requested number of GPUs exceeds available GPUs");
+  }
+
+  if (num_gpus == 0) {
+    num_gpus = topology.gpus.size();
+    gpu_ids.resize(num_gpus);
+    std::iota(gpu_ids.begin(), gpu_ids.end(), 0);
+  }
+
+  std::unordered_map<int, std::pair<size_t, int>> available_gpu_ids;
+  for (const auto& gpu : topology.gpus) {
+    auto device_id = static_cast<int32_t>(gpu.id);
+    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{device_id});
+    auto const [free, total]     = rmm::available_device_memory();
+    available_gpu_ids[device_id] = {total, gpu.numa_node};
+  }
+
+  std::vector<gpu_info> gpu_infos;
+  for (const auto& gpu_id : gpu_ids) {
+    auto it = available_gpu_ids.find(gpu_id);
+    if (it == available_gpu_ids.end()) {
+      throw std::runtime_error("Requested GPU ID " + std::to_string(gpu_id) +
+                               " is not available in the system topology");
+    }
+    gpu_info& info    = gpu_infos.emplace_back();
+    info.space_id     = it->first;
+    info.hw_id        = it->first;
+    info.gpu_capacity = it->second.first;
+    info.numa_id      = it->second.second;
+  }
+
+  return gpu_infos;
+}
+
+std::vector<reservation_manager_configurator::numa_region_info>
+reservation_manager_configurator::extract_numa_region_ids(
+  const std::vector<gpu_info>& gpus, const system_topology_info& topology) const
+{
+  std::vector<numa_region_info> numa_region_infos;
+  std::set<int> numa_region_ids;
+  for (const auto& gpu : gpus) {
+    auto const* node            = topology.find_numa_node(gpu.numa_id);
+    auto const numa_capacity    = topology.get_numa_memory_capacity(gpu.numa_id);
+    bool const is_device_memory = node != nullptr && node->is_device_memory;
+    if (std::holds_alternative<bind_host_id_to_gpu_id>(_host_id_policy)) {
+      numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.space_id,
+                                                      .numa_id          = gpu.numa_id,
+                                                      .numa_capacity    = numa_capacity,
+                                                      .is_device_memory = is_device_memory});
+    } else if (std::holds_alternative<bind_host_id_to_numa_id>(_host_id_policy)) {
+      if (!numa_region_ids.contains(gpu.numa_id)) {
+        numa_region_infos.emplace_back(numa_region_info{.space_id         = gpu.numa_id,
+                                                        .numa_id          = gpu.numa_id,
+                                                        .numa_capacity    = numa_capacity,
+                                                        .is_device_memory = is_device_memory});
+        numa_region_ids.insert(gpu.numa_id);
+      }
+    }
+  }
+  return numa_region_infos;
+}
+
+}  // namespace memory
+}  // namespace cucascade

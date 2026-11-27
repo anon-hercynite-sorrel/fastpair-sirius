@@ -1,0 +1,463 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @file test_join_expression_key.cpp
+ * @brief issue #329: hash-join equality conditions with expression keys (e.g. `a = b * 10`) are
+ *        materialized into a projection below the join, and the condition side is rewritten to a
+ *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
+ */
+
+#include "expression/ast/node.hpp"
+#include "expression/join_condition.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_context.hpp"
+#include "utils/sirius_test_env.hpp"
+
+#include <catch.hpp>
+#include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <duckdb/planner/planner.hpp>
+#include <unistd.h>
+
+#include <cstdio>
+#include <filesystem>
+
+using namespace duckdb;
+
+namespace {
+
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
+class scoped_temp_db_path {
+ public:
+  scoped_temp_db_path()
+  {
+    char tmpl[] = "/tmp/sirius_join_expr_key_XXXXXX";
+    int fd      = ::mkstemp(tmpl);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+    ::unlink(tmpl);
+    _path = tmpl;
+  }
+
+  ~scoped_temp_db_path()
+  {
+    if (!_path.empty()) {
+      std::remove(_path.c_str());
+      std::remove((_path + ".wal").c_str());
+    }
+  }
+
+  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
+  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
+
+  const std::string& path() const { return _path; }
+
+ private:
+  std::string _path;
+};
+
+/// Generate a Sirius physical plan from a SQL query string.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
+  Connection& con, const std::string& query)
+{
+  auto& context = *con.context;
+
+  auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
+  auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
+  disabled.insert(OptimizerType::IN_CLAUSE);
+  disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+
+  con.Query("BEGIN TRANSACTION");
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
+  try {
+    Parser parser(context);
+    parser.ParseQuery(query);
+    REQUIRE(!parser.statements.empty());
+
+    Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    REQUIRE(planner.plan);
+
+    auto plan = std::move(planner.plan);
+
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
+      Optimizer optimizer(*planner.binder, context);
+      plan = optimizer.Optimize(std::move(plan));
+    }
+
+    plan->ResolveOperatorTypes();
+
+    ColumnBindingResolver resolver;
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
+    resolver.VisitOperator(*plan);
+
+    sirius::planner::sirius_physical_plan_generator gen(context);
+    result = gen.create_plan(std::move(plan));
+  } catch (duckdb::InternalException&) {
+    con.Query("ROLLBACK");
+    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
+    return nullptr;
+  } catch (...) {
+    con.Query("ROLLBACK");
+    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
+    throw;
+  }
+
+  con.Query("COMMIT");
+  DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
+  return result;
+}
+
+sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physical_operator* root)
+{
+  if (!root) { return nullptr; }
+  if (root->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    return &root->Cast<sirius::op::sirius_physical_hash_join>();
+  }
+  for (auto& child : root->children) {
+    auto* found = find_hash_join(child.get());
+    if (found) { return found; }
+  }
+  return nullptr;
+}
+
+bool is_bound_ref(const sirius::ast::node& side) { return side.holds<sirius::ast::reference>(); }
+
+/// Assert that every equality condition side of @p hj is a plain column reference (BOUND_REF),
+/// i.e. any complex expression was materialized out into a projection below the join.
+void require_all_equality_sides_are_references(sirius::op::sirius_physical_hash_join& hj)
+{
+  for (auto& c : hj.conditions) {
+    if (c.comparison != sirius::comparison_type::equal &&
+        c.comparison != sirius::comparison_type::not_distinct_from) {
+      continue;
+    }
+    CHECK(is_bound_ref(*c.left));
+    CHECK(is_bound_ref(*c.right));
+  }
+}
+
+bool has_projection_child(sirius::op::sirius_physical_hash_join& hj)
+{
+  for (auto& child : hj.children) {
+    // Plan-gen wraps each join child in a CONCAT -> PARTITION chain; the materializing
+    // PROJECTION sits below the wraps.
+    auto* node = child.get();
+    while (node != nullptr && (node->type == sirius::op::SiriusPhysicalOperatorType::CONCAT ||
+                               node->type == sirius::op::SiriusPhysicalOperatorType::PARTITION)) {
+      node = node->children.empty() ? nullptr : node->children[0].get();
+    }
+    if (node != nullptr && node->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct join_expression_key_fixture {
+  join_expression_key_fixture()
+  {
+    auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
+               "minimal.yaml";
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
+    con = std::make_unique<Connection>(*db);
+
+    // big_left is larger so the optimizer keeps small_right as the build side.
+    con->Query("CREATE TABLE big_left (id INTEGER, val INTEGER)");
+    con->Query(
+      "INSERT INTO big_left VALUES (0,0),(1,3),(2,6),(3,9),(4,12),(5,15),(6,18),(7,21),(8,24),"
+      "(9,27),(10,30),(11,33),(12,36),(13,39),(14,42),(15,45),(16,48),(17,51),(18,54),(19,57)");
+    con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
+    con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
+  }
+
+  // Declared before db/con so the backing file outlives the database.
+  scoped_temp_db_path _db_path;
+  std::unique_ptr<DuckDB> db;
+  std::unique_ptr<Connection> con;
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - single expression side is materialized and rewritten",
+                 "[join_expression_key][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid * 10");
+  if (!plan) {
+    WARN("Plan generation failed (no DuckDB table scan support); skipping");
+    return;
+  }
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+
+  // The `r.rid * 10` key is materialized, so both equality sides are now plain references.
+  require_all_equality_sides_are_references(*hj);
+
+  // A materializing projection was inserted directly below the join.
+  CHECK(has_projection_child(*hj));
+
+  // The synthetic key column is excluded from the join output: SELECT * over (id,val)+(rid,other)
+  // is 4 columns, not 5.
+  CHECK(hj->lhs_output_columns.col_idxs.size() + hj->rhs_output_columns.col_idxs.size() == 4);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - expressions on both sides are materialized",
+                 "[join_expression_key][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con, "SELECT * FROM big_left l JOIN small_right r ON l.id + 1 = r.rid + 1");
+  if (!plan) {
+    WARN("Plan generation failed; skipping");
+    return;
+  }
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  require_all_equality_sides_are_references(*hj);
+  CHECK(has_projection_child(*hj));
+  CHECK(hj->lhs_output_columns.col_idxs.size() + hj->rhs_output_columns.col_idxs.size() == 4);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - plain column join is not materialized",
+                 "[join_expression_key][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
+  if (!plan) {
+    WARN("Plan generation failed; skipping");
+    return;
+  }
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  // Fast path: plain-reference keys need no projection below the join.
+  CHECK_FALSE(has_projection_child(*hj));
+  require_all_equality_sides_are_references(*hj);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - mixed SEMI and ANTI materialize casts in hash keys",
+                 "[join_expression_key][isolated_context]")
+{
+  const bool anti             = GENERATE(false, true);
+  const bool right_family     = GENERATE(false, true);
+  const std::string residual  = GENERATE("<>", "IS NOT DISTINCT FROM");
+  const std::string lhs       = right_family ? "small_right" : "big_left";
+  const std::string rhs       = right_family ? "big_left" : "small_right";
+  const std::string lhs_key   = right_family ? "rid" : "id";
+  const std::string rhs_key   = right_family ? "id" : "rid";
+  const std::string lhs_value = right_family ? "other" : "val";
+  const std::string rhs_value = right_family ? "val" : "other";
+  const auto query = "SELECT l.* FROM " + lhs + " l " + (anti ? "ANTI" : "SEMI") + " JOIN " + rhs +
+                     " r ON CAST(l." + lhs_key + " AS SMALLINT) = CAST(r." + rhs_key +
+                     " AS SMALLINT) AND l." + lhs_value + " " + residual + " r." + rhs_value;
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
+                                          : (anti ? JoinType::ANTI : JoinType::SEMI);
+  REQUIRE(hj->join_type == expected_type);
+  CHECK(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 2);
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison == sirius::comparison_type::equal) {
+      CHECK(is_bound_ref(*condition.left));
+      CHECK(is_bound_ref(*condition.right));
+    }
+  }
+  CHECK(hj->types.size() == 2);
+  const auto& output = right_family ? hj->rhs_output_columns : hj->lhs_output_columns;
+  CHECK(output.col_idxs.size() == 2);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - hash-only casts are evaluated before partitioning",
+                 "[join_expression_key][isolated_context]")
+{
+  const std::string join_type = GENERATE("JOIN", "SEMI JOIN", "ANTI JOIN");
+  const auto query            = "SELECT l.* FROM big_left l " + join_type +
+                     " small_right r ON CAST(l.id AS SMALLINT) = CAST(r.rid AS SMALLINT)";
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  CHECK(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 1);
+  CHECK(is_bound_ref(*hj->conditions[0].left));
+  CHECK(is_bound_ref(*hj->conditions[0].right));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - string case inequality operand is materialized",
+                 "[join_expression_key][string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO countries VALUES (0, 'Germany'), (1, 'France')")->HasError());
+  REQUIRE(!con->Query("CREATE TABLE birth_countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(
+    !con->Query("INSERT INTO birth_countries VALUES (0, 'GERMANY'), (1, 'FRANCE'), (2, 'USA')")
+       ->HasError());
+  auto const name = GENERATE("upper", "lower");
+  auto plan       = generate_sirius_plan(
+    *con,
+    "SELECT l.id FROM birth_countries l JOIN countries r ON l.id = r.id AND l.country <> " +
+      std::string(name) + "(r.country)");
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  bool saw_inequality = false;
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison != sirius::comparison_type::not_equal) { continue; }
+    saw_inequality = true;
+    CHECK(is_bound_ref(*condition.left));
+    CHECK(is_bound_ref(*condition.right));
+  }
+  REQUIRE(saw_inequality);
+  CHECK(has_projection_child(*hj));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "projection - string case functions plan successfully",
+                 "[string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE names (name VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
+  auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
+  REQUIRE(plan);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "DELIM join with an arbitrary condition declines before wrapping the join",
+                 "[join_expression_key][isolated_context]")
+{
+  auto join =
+    make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_DELIM_JOIN);
+  join->delim_flipped = GENERATE(false, true);
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(0)));
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(1)));
+  join->conditions.emplace_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                ExpressionType::COMPARE_EQUAL);
+  join->conditions.emplace_back(BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN,
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1)));
+  join->ResolveOperatorTypes();
+  sirius::planner::sirius_physical_plan_generator planner(*con->context);
+  CHECK_THROWS_WITH(planner.create_plan(std::move(join)),
+                    Catch::Matchers::ContainsSubstring("arbitrary join conditions"));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "BUILD_PROBE resident budget stays connection-local through SET and RESET",
+                 "[config][query_options][build_probe][isolated_context]")
+{
+  Connection other(*db);
+  auto runtime = con->context->registered_state->Get<SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  auto const default_budget =
+    runtime->get_config().get_operator_params().max_build_probe_resident_bytes;
+  REQUIRE(default_budget > 16);
+  auto execute = [](Connection& connection, const char* sql) {
+    auto result = connection.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto make_plan = [](Connection& connection) {
+    auto plan = generate_sirius_plan(
+      connection, "SELECT l.val, r.other FROM big_left l JOIN small_right r ON l.id = r.rid");
+    REQUIRE(plan);
+    REQUIRE(find_hash_join(plan.get()));
+    return plan;
+  };
+  auto require_admission =
+    [&](sirius::op::sirius_physical_operator& plan, uint64_t budget, bool admitted) {
+      auto* join = find_hash_join(&plan);
+      REQUIRE(join);
+      CHECK(join->max_build_probe_resident_bytes == budget);
+      // This planner-only fixture bypasses pipeline conversion, which normally assigns IDs.
+      join->operator_id = 0;
+      // Measure a foldable two-row INTEGER build, well within the hash-table budget.
+      auto strategy = join->get_partition_strategy({16, true, true, 16, 2, 2, 16});
+      CHECK(strategy.build_probe == admitted);
+    };
+  auto require_connection = [&](Connection& connection, uint64_t budget, bool admitted) {
+    auto readback =
+      connection.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
+    REQUIRE(readback);
+    REQUIRE_FALSE(readback->HasError());
+    CHECK(readback->Collection().GetValue(0, 0).GetValue<uint64_t>() == budget);
+    auto plan = make_plan(connection);
+    require_admission(*plan, budget, admitted);
+  };
+
+  execute(*con, "SET max_build_probe_resident_bytes = 0");
+  auto disabled_plan = make_plan(*con);
+  require_connection(*con, 0, false);
+  require_connection(other, default_budget, true);
+
+  execute(other, "SET SESSION max_build_probe_resident_bytes = 65536");
+  auto enabled_plan = make_plan(other);
+  require_connection(other, 65536, true);
+  require_connection(*con, 0, false);
+
+  execute(other, "RESET max_build_probe_resident_bytes");
+  require_connection(other, default_budget, true);
+  require_connection(*con, 0, false);
+
+  execute(other, "SET max_build_probe_resident_bytes = 0");
+  execute(*con, "RESET max_build_probe_resident_bytes");
+  require_connection(*con, default_budget, true);
+  require_connection(other, 0, false);
+  // Plans retain their captured budgets across both connections' SET/RESET calls.
+  require_admission(*disabled_plan, 0, false);
+  require_admission(*enabled_plan, 65536, true);
+
+  for (auto sql : {"SET GLOBAL max_build_probe_resident_bytes = 1",
+                   "SET max_build_probe_resident_bytes = -1",
+                   "SET max_build_probe_resident_bytes = 18446744073709551616"}) {
+    auto rejected = con->Query(sql);
+    REQUIRE(rejected);
+    REQUIRE(rejected->HasError());
+  }
+  require_connection(*con, default_budget, true);
+  require_connection(other, 0, false);
+  Connection fresh(*db);
+  require_connection(fresh, default_budget, true);
+  CHECK(runtime->get_config().get_operator_params().max_build_probe_resident_bytes ==
+        default_budget);
+}

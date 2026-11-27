@@ -1,0 +1,142 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <duckdb.hpp>
+
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <string>
+
+namespace sirius::test {
+
+// SIRIUS_TEST_INTEGRATION_CONFIG selects the config for shared and child-process fixtures.
+std::filesystem::path integration_config_path();
+// Return unused CUDA async-pool blocks to the driver between test cases.
+void trim_cuda_memory_pools_for_testing();
+
+/**
+ * @brief Open a DuckDB database with Sirius enabled and configured from @p config_path.
+ *
+ * SIRIUS_CONFIG_FILE and SIRIUS_DISABLE are set only while the database is created, which is
+ * when the extension reads them, and are restored afterwards.
+ *
+ * @param path Database file, or nullptr for an in-memory database.
+ * @param config_path Sirius config file.
+ */
+std::unique_ptr<duckdb::DuckDB> open_sirius_db(char const* path,
+                                               std::filesystem::path const& config_path);
+
+/**
+ * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
+ *
+ * The constructor creates a DuckDB instance with @p config_path, which triggers the extension
+ * callback to create a SiriusContext.
+ * All tests in the "shared" phase get connections to this DuckDB instance, avoiding
+ * the overhead of repeated SiriusContext creation/destruction.
+ *
+ * For tests tagged [isolated_context] or [integration] that need their own SiriusContext,
+ * the environment is temporarily paused (DuckDB destroyed) via a Catch2
+ * listener, then resumed after the isolated test completes.
+ */
+class shared_test_env {
+ public:
+  explicit shared_test_env(const std::filesystem::path& config_path);
+  ~shared_test_env();
+
+  shared_test_env(const shared_test_env&)            = delete;
+  shared_test_env& operator=(const shared_test_env&) = delete;
+  shared_test_env(shared_test_env&&)                 = delete;
+  shared_test_env& operator=(shared_test_env&&)      = delete;
+
+  /**
+   * @brief Create a new connection to the shared DuckDB instance.
+   *
+   * The extension callback's OnConnectionOpened automatically registers
+   * the shared SiriusContext into the new connection's registered_state.
+   */
+  duckdb::Connection make_connection();
+
+  /**
+   * @brief Get a reference to the shared DuckDB instance.
+   */
+  duckdb::DuckDB& database();
+
+  /**
+   * @brief Returns true if the environment is active (DuckDB instance exists).
+   */
+  bool is_active() const { return db_ != nullptr; }
+
+  /**
+   * @brief Temporarily destroy the DuckDB instance.
+   *
+   * Called by the Catch2 listener before an isolated test runs, allowing
+   * the test to create its own DuckDB with a different config.
+   */
+  void pause();
+
+  /**
+   * @brief Recreate the DuckDB instance.
+   *
+   * Called by the Catch2 listener after an isolated test completes.
+   */
+  void resume();
+
+ private:
+  void create_db();
+
+  std::filesystem::path config_path_;
+  std::unique_ptr<duckdb::DuckDB> db_;
+};
+
+/**
+ * @brief Non-owning pointer to the shared test environment.
+ *
+ * Managed by main() in unittest.cpp. Non-null for the entire test run.
+ * Check is_active() before using — it may be temporarily paused for isolated tests.
+ */
+extern shared_test_env* g_shared_env;
+extern shared_test_env* g_integration_env;
+
+// 2-GPU integration env (TEST-01/02 v1.2). Mirrors g_integration_env but
+// backed by integration-2gpu.yaml. TEST_CASE bodies can select which env
+// to use via acquire_integration_env_for(num_gpus) or directly via
+// g_integration_env_2gpu->is_active().
+extern shared_test_env* g_integration_env_2gpu;
+
+/**
+ * @brief Returns the shared env corresponding to num_gpus, for binding by the caller.
+ *
+ * Caller is responsible for resume()/pause() lifecycle if not using the Catch2
+ * listener's tag-based mechanism. On single-GPU hosts when num_gpus == 2, returns
+ * nullptr (caller should WARN+return per Catch2 convention).
+ *
+ * @param num_gpus 1 returns g_integration_env; 2 returns g_integration_env_2gpu
+ *                 (or nullptr on single-GPU host); other values return nullptr.
+ */
+shared_test_env* acquire_integration_env_for(int num_gpus);
+
+/**
+ * @brief Returns whether at least @p n GPUs are visible, WARNing when not so the caller can skip.
+ *
+ * Tests that need more than one GPU must be tagged [multi_gpu]: CI runs the rest in per-GPU
+ * shards with SIRIUS_TEST_SINGLE_GPU set, under which a shortfall FAILs instead of skipping.
+ */
+bool has_gpus(int n);
+
+}  // namespace sirius::test

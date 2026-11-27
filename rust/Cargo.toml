@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/telemetry/bridge",
+    "crates/telemetry/model",
+    "crates/telemetry/store",
+    "crates/telemetry/analyzer",
+    "crates/telemetry/server",
+    "crates/sirius-sys",
+    "crates/sirius",
+    "crates/sirius-ffi"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# cxx and cxx-build must resolve to the same version (the generated bridge is
+# version-coupled). The shared "1" caret + the lockfile keep them in lockstep.
+cxx = "1"
+cxx-build = "1"
+sirius-sys = { path = "crates/sirius-sys" }

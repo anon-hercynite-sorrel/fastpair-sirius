@@ -1,0 +1,163 @@
+{
+  "buildPresets": [
+    {
+      "configurePreset": "debug",
+      "name": "debug"
+    },
+    {
+      "configurePreset": "release",
+      "name": "release"
+    },
+    {
+      "configurePreset": "relwithdebinfo",
+      "name": "relwithdebinfo"
+    },
+    {
+      "configurePreset": "clang-debug",
+      "name": "clang-debug"
+    },
+    {
+      "configurePreset": "clang-release",
+      "name": "clang-release"
+    },
+    {
+      "configurePreset": "clang-relwithdebinfo",
+      "name": "clang-relwithdebinfo"
+    },
+    {
+      "configurePreset": "clang-asan",
+      "name": "clang-asan"
+    },
+    {
+      "configurePreset": "clang-tsan",
+      "name": "clang-tsan"
+    }
+  ],
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 26,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "EXPORT_DYNAMIC_SYMBOLS": "ON",
+        "SIRIUS_BUILD_TESTS": "ON"
+      },
+      "generator": "Ninja",
+      "hidden": true,
+      "name": "base"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CUDA_HOST_COMPILER": "clang++",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
+        "CMAKE_C_COMPILER": "clang",
+        "EXPORT_DYNAMIC_SYMBOLS": "OFF"
+      },
+      "hidden": true,
+      "inherits": "base",
+      "name": "base-clang"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "ENABLE_SANITIZER": "FALSE",
+        "ENABLE_UBSAN": "0"
+      },
+      "displayName": "GCC Debug",
+      "inherits": "base",
+      "name": "debug"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "GCC Release",
+      "inherits": "base",
+      "name": "release"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "GCC RelWithDebInfo",
+      "inherits": "base",
+      "name": "relwithdebinfo"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/clang-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "ENABLE_SANITIZER": "FALSE",
+        "ENABLE_UBSAN": "0"
+      },
+      "displayName": "Clang Debug",
+      "inherits": "base-clang",
+      "name": "clang-debug"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/clang-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "displayName": "Clang Release",
+      "inherits": "base-clang",
+      "name": "clang-release"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/clang-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "displayName": "Clang RelWithDebInfo",
+      "inherits": "base-clang",
+      "name": "clang-relwithdebinfo"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CUDA_FLAGS": "-Xcompiler -fsanitize=$env{SIRIUS_SANITIZER_TYPE} -Xcompiler -fno-omit-frame-pointer -g",
+        "CMAKE_CXX_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE} -fno-omit-frame-pointer -g",
+        "CMAKE_C_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE} -fno-omit-frame-pointer -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=$env{SIRIUS_SANITIZER_TYPE}"
+      },
+      "hidden": true,
+      "inherits": "base-clang",
+      "name": "clang-sanitizer-base"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/clang-asan",
+      "displayName": "Clang ASan (RelWithDebInfo)",
+      "environment": {
+        "SIRIUS_SANITIZER_TYPE": "address"
+      },
+      "inherits": "clang-sanitizer-base",
+      "name": "clang-asan"
+    },
+    {
+      "binaryDir": "${fileDir}/../build/clang-tsan",
+      "displayName": "Clang TSan (RelWithDebInfo)",
+      "environment": {
+        "SIRIUS_SANITIZER_TYPE": "thread"
+      },
+      "inherits": "clang-sanitizer-base",
+      "name": "clang-tsan"
+    }
+  ],
+  "version": 6
+}

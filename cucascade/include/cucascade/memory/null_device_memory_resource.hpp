@@ -1,0 +1,77 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cucascade/cuda/stream.hpp>
+
+#include <cuda/memory_resource>
+
+#include <cstddef>
+
+namespace cucascade {
+namespace memory {
+
+/**
+ * A no-op memory resource used for DISK tier to satisfy API requirements.
+ * - allocate always returns nullptr
+ * - deallocate is a no-op
+ */
+class null_device_memory_resource {
+ public:
+  null_device_memory_resource()  = default;
+  ~null_device_memory_resource() = default;
+
+  void* allocate([[maybe_unused]] ::cuda::stream_ref stream,
+                 [[maybe_unused]] std::size_t bytes,
+                 [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
+  {
+    return nullptr;
+  }
+
+  void deallocate([[maybe_unused]] ::cuda::stream_ref stream,
+                  [[maybe_unused]] void* p,
+                  [[maybe_unused]] std::size_t bytes,
+                  [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+  }
+
+  void* allocate_sync([[maybe_unused]] std::size_t bytes,
+                      [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t))
+  {
+    return nullptr;
+  }
+
+  void deallocate_sync([[maybe_unused]] void* p,
+                       [[maybe_unused]] std::size_t bytes,
+                       [[maybe_unused]] std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+  }
+
+  bool operator==(null_device_memory_resource const& other) const noexcept
+  {
+    return this == &other;
+  }
+
+  friend void get_property(null_device_memory_resource const&,
+                           ::cuda::mr::device_accessible) noexcept
+  {
+  }
+};
+
+}  // namespace memory
+}  // namespace cucascade

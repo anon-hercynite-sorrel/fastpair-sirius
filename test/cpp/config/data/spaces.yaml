@@ -1,0 +1,29 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        per_stream_reservation: true
+        reservation_limit_fraction: 0.9
+        downgrade_trigger_fraction: 0.8
+        downgrade_stop_fraction: 0.7
+        memory_capacity: 1073741824
+    host:
+      - numa_id: -1
+        reservation_limit_fraction: 0.9
+        downgrade_trigger_fraction: 0.8
+        downgrade_stop_fraction: 0.7
+        memory_capacity: 1073741824
+        initial_number_pools: 2
+    disk:
+      - disk_id: 0
+        mount_path: "/tmp/host0"
+        memory_capacity: 1073741824
+      - disk_id: 1
+        mount_path: "/tmp/host1"
+        memory_capacity: 1073741824
+  executor:
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms

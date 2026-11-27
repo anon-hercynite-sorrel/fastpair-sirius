@@ -1,0 +1,7 @@
+# Allowlist for scripts/check_orphan_tests.py (pre-commit hook).
+#
+# A test_*.cpp that exists in the tree but is missing from TEST_SOURCES never
+# compiles, so its coverage silently vanishes. The hook makes that a commit /
+# CI-lint error. This file is the ONLY escape hatch: every entry must carry a
+# reason, and the list should only ever shrink — when adding a new test file,
+# add it to TEST_SOURCES, not here.

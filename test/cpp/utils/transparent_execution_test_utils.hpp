@@ -1,0 +1,79 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "catch.hpp"
+#include "sirius_context.hpp"
+#include "utils/compressed_materialization_recorder.hpp"
+
+#include <duckdb.hpp>
+
+namespace sirius::test {
+
+inline duckdb::shared_ptr<duckdb::SiriusContext> get_registered_sirius_context(
+  duckdb::Connection& con)
+{
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  return sirius_ctx;
+}
+
+inline duckdb::SiriusContext::transparent_execution_stats get_transparent_execution_stats(
+  duckdb::Connection& con)
+{
+  return get_registered_sirius_context(con)->get_transparent_execution_stats();
+}
+
+/// Keep the observer with this test connection, never in production SiriusContext.
+/// The first snapshot subscribes; take it before the operation being measured.
+class compressed_materialization_test_state : public duckdb::ClientContextState {
+ public:
+  explicit compressed_materialization_test_state(event::query_event_publisher& publisher)
+    : recorder(publisher)
+  {
+  }
+  compressed_materialization_recorder recorder;
+};
+
+inline compressed_materialization_stats get_compressed_materialization_stats(
+  duckdb::Connection& con)
+{
+  auto observer = con.context->registered_state->GetOrCreate<compressed_materialization_test_state>(
+    "compressed_materialization_test", get_registered_sirius_context(con)->get_event_publisher());
+  return observer->recorder.snapshot();
+}
+
+inline void require_transparent_execution_delta(
+  const duckdb::SiriusContext::transparent_execution_stats& before,
+  const duckdb::SiriusContext::transparent_execution_stats& after,
+  uint64_t expected_rebind_delta,
+  uint64_t expected_fallback_delta,
+  uint64_t expected_execution_delta,
+  uint64_t expected_runtime_fallback_delta = 0)
+{
+  CHECK(after.certificate_mismatches == before.certificate_mismatches);
+  CHECK(after.certificate_incompletes == before.certificate_incompletes);
+  CHECK(after.checkpoint_revalidation_failures == before.checkpoint_revalidation_failures);
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + expected_rebind_delta);
+  REQUIRE(after.fallbacks == before.fallbacks + expected_fallback_delta);
+  REQUIRE(after.executions == before.executions + expected_execution_delta);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + expected_runtime_fallback_delta);
+  REQUIRE(after.late_failure_no_replay == before.late_failure_no_replay);
+  REQUIRE(after.lease_held_at_replay == before.lease_held_at_replay);
+}
+
+}  // namespace sirius::test

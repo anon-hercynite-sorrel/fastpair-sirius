@@ -1,0 +1,425 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "operator_test_utils.hpp"
+
+#include <catch.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/filter/table_filter_functions.hpp>
+#include <helper/type_conversions.hpp>
+#include <op/sirius_physical_top_n.hpp>
+#include <op/sirius_physical_top_n_merge.hpp>
+
+using namespace sirius::op;
+using sirius::op::pipelineable_operator_data;
+using namespace cucascade;
+using namespace cucascade::memory;
+using namespace sirius::test::operator_utils;
+
+// Helper functions - defined outside anonymous namespace to avoid ODR issues with
+// LogicalType::BIGINT
+static duckdb::BoundOrderByNode make_order(duckdb::idx_t col_idx,
+                                           duckdb::OrderType dir = duckdb::OrderType::DESCENDING)
+{
+  return duckdb::BoundOrderByNode(dir,
+                                  duckdb::OrderByNullType::NULLS_LAST,
+                                  duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                                    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), col_idx));
+}
+
+static std::shared_ptr<data_batch> make_batch(memory_space& space,
+                                              const std::vector<int64_t>& order_vals,
+                                              const std::vector<int64_t>& payload_vals)
+{
+  return make_two_column_batch<int64_t, int64_t>(
+    space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
+}
+
+static std::shared_ptr<data_batch> make_range_batch(memory_space& space,
+                                                    int64_t start,
+                                                    int64_t count,
+                                                    int64_t payload_scale)
+{
+  std::vector<int64_t> order_vals;
+  std::vector<int64_t> payload_vals;
+  order_vals.reserve(count);
+  payload_vals.reserve(count);
+  for (int64_t i = 0; i < count; ++i) {
+    auto value = start + i;
+    order_vals.push_back(value);
+    payload_vals.push_back(value * payload_scale);
+  }
+  return make_batch(space, order_vals, payload_vals);
+}
+
+TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_batch(*space, {5, 1, 7, 3, 9, 2, 8}, {50, 10, 70, 30, 90, 20, 80}));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // order column
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // payload
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+
+  sirius_physical_top_n topn(sirius::from_duckdb_vec(types),
+                             std::move(orders),
+                             /*limit=*/3,
+                             /*offset=*/0,
+                             nullptr,
+                             0);
+
+  auto out = topn.execute(pipelineable_operator_data({batches[0]}), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
+
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
+  auto payload_out = copy_column_to_host<int64_t>(view.column(1));
+
+  std::vector<int64_t> expected_order{9, 8, 7};
+  std::vector<int64_t> expected_payload{90, 80, 70};
+
+  REQUIRE(orders_out == expected_order);
+  REQUIRE(payload_out == expected_payload);
+}
+
+TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physical_top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // order by col0 desc, then col1 asc
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_batch(*space, {5, 5, 7, 7, 7, 6, 4, 8}, {2, 1, 3, 4, 1, 9, 5, 0}));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // order
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // payload
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+  orders.push_back(make_order(1, duckdb::OrderType::ASCENDING));
+
+  sirius_physical_top_n topn(sirius::from_duckdb_vec(types),
+                             std::move(orders),
+                             /*limit=*/4,
+                             /*offset=*/0,
+                             nullptr,
+                             0);
+
+  auto out = topn.execute(pipelineable_operator_data({batches[0]}), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
+
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
+  auto payload_out = copy_column_to_host<int64_t>(view.column(1));
+
+  // Expected ordering: (8,0), (7,1), (7,3), (7,4)
+  std::vector<int64_t> expected_order{8, 7, 7, 7};
+  std::vector<int64_t> expected_payload{0, 1, 3, 4};
+
+  REQUIRE(orders_out == expected_order);
+  REQUIRE(payload_out == expected_payload);
+}
+
+TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top_n_merge]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 10, 10));
+  batches.push_back(make_range_batch(*space, 10, 10, 10));
+  batches.push_back(make_range_batch(*space, 20, 10, 10));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
+                                         std::move(orders),
+                                         /*limit=*/5,
+                                         /*offset=*/3,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
+
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
+  auto payload_out = copy_column_to_host<int64_t>(view.column(1));
+
+  std::vector<int64_t> expected_order{26, 25, 24, 23, 22};
+  std::vector<int64_t> expected_payload{260, 250, 240, 230, 220};
+
+  REQUIRE(orders_out == expected_order);
+  REQUIRE(payload_out == expected_payload);
+}
+
+TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_top_n_merge]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 5, 1));
+  batches.push_back(make_range_batch(*space, 5, 5, 1));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
+                                         std::move(orders),
+                                         /*limit=*/0,
+                                         /*offset=*/2,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().empty());
+}
+
+TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_merge]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_batch(*space, {}, {}));
+  batches.push_back(make_batch(*space, {}, {}));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(sirius::from_duckdb_vec(types),
+                                         std::move(orders),
+                                         /*limit=*/3,
+                                         /*offset=*/0,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
+
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
+  REQUIRE(view.num_rows() == 0);
+}
+
+TEST_CASE("Top-N publishes only complete monotonic boundaries", "[physical_top_n][topn_dynamic]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  bool ascending = GENERATE(true, false);
+  auto type      = ascending ? duckdb::ExpressionType::COMPARE_LESSTHAN
+                             : duckdb::ExpressionType::COMPARE_GREATERTHAN;
+  auto filter = duckdb::make_shared_ptr<duckdb::DynamicFilterData>(type, duckdb::Value::BIGINT(0));
+  filter->SetValue(duckdb::Value::BIGINT(999));
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(
+    make_order(0, ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING));
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}),
+    std::move(orders),
+    2,
+    1,
+    filter,
+    0);
+  REQUIRE_FALSE(filter->initialized);
+  auto run = [&](std::vector<int64_t> values) {
+    auto batch = make_batch(*space, values, values);
+    return topn.execute(pipelineable_operator_data({batch}), default_stream());
+  };
+  run({1, 2});
+  REQUIRE_FALSE(filter->initialized);
+  run({1, 2, 3, 4});
+  REQUIRE(filter->initialized);
+  CHECK(filter->constant.GetValue<int64_t>() == (ascending ? 3 : 2));
+  run(ascending ? std::vector<int64_t>{10, 11, 12} : std::vector<int64_t>{-3, -2, -1});
+  CHECK(filter->constant.GetValue<int64_t>() == (ascending ? 3 : 2));
+  run(ascending ? std::vector<int64_t>{-3, -2, -1} : std::vector<int64_t>{10, 11, 12});
+  CHECK(filter->constant.GetValue<int64_t>() == (ascending ? -1 : 10));
+}
+
+TEST_CASE("Top-N merge publishes its boundary before applying OFFSET",
+          "[physical_top_n][topn_dynamic]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  bool ascending = GENERATE(true, false);
+  bool inclusive = GENERATE(true, false);
+  CAPTURE(ascending, inclusive);
+  auto comparison = ascending ? (inclusive ? duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO
+                                           : duckdb::ExpressionType::COMPARE_LESSTHAN)
+                              : (inclusive ? duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO
+                                           : duckdb::ExpressionType::COMPARE_GREATERTHAN);
+  auto filter =
+    duckdb::make_shared_ptr<duckdb::DynamicFilterData>(comparison, duckdb::Value::BIGINT(0));
+  auto direction = ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING;
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, direction));
+  orders.push_back(make_order(1, direction));
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}),
+    std::move(orders),
+    2,
+    1,
+    filter,
+    0);
+  sirius_physical_top_n_merge merge(&topn);
+  auto a = topn.execute(pipelineable_operator_data({make_batch(*space, {1, 2}, {1, 2})}),
+                        default_stream());
+  auto b = topn.execute(pipelineable_operator_data({make_batch(*space, {3, 4}, {3, 4})}),
+                        default_stream());
+  REQUIRE_FALSE(filter->initialized);
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (auto* data : {a.get(), b.get()}) {
+    auto const& batches = dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches();
+    partials.insert(partials.end(), batches.begin(), batches.end());
+  }
+  auto result = merge.execute(pipelineable_operator_data(partials), default_stream());
+  CHECK(filter->initialized == inclusive);
+  if (inclusive) CHECK(filter->constant.GetValue<int64_t>() == (ascending ? 3 : 2));
+  CHECK(filter->comparison_type == comparison);
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()[0]);
+  auto expected = ascending ? std::vector<int64_t>{2, 3} : std::vector<int64_t>{3, 2};
+  CHECK(copy_column_to_host<int64_t>(view.column(0)) == expected);
+}
+
+TEST_CASE("Top-N leaves incompatible or nulls-first filters inactive",
+          "[physical_top_n][topn_dynamic]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto scenario = GENERATE(0, 1, 2);
+  auto filter   = duckdb::make_shared_ptr<duckdb::DynamicFilterData>(
+    scenario == 2 ? duckdb::ExpressionType::COMPARE_LESSTHAN
+                  : duckdb::ExpressionType::COMPARE_GREATERTHAN,
+    scenario == 0 ? duckdb::Value::INTEGER(0) : duckdb::Value::BIGINT(0));
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0));
+  if (scenario == 1) orders[0].null_order = duckdb::OrderByNullType::NULLS_FIRST;
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}),
+    std::move(orders),
+    2,
+    0,
+    filter,
+    0);
+  auto result = topn.execute(pipelineable_operator_data({make_batch(*space, {1, 2, 3}, {1, 2, 3})}),
+                             default_stream());
+  CHECK_FALSE(filter->initialized);
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()[0]);
+  CHECK(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>{3, 2});
+}
+
+TEST_CASE("Multi-key Top-N preserves better later rows tied on the leading key",
+          "[physical_top_n][topn_dynamic]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  bool ascending = GENERATE(true, false);
+  bool inclusive = GENERATE(true, false);
+  size_t offset  = GENERATE(0, 1);
+  CAPTURE(ascending, inclusive, offset);
+  auto comparison = ascending ? (inclusive ? duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO
+                                           : duckdb::ExpressionType::COMPARE_LESSTHAN)
+                              : (inclusive ? duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO
+                                           : duckdb::ExpressionType::COMPARE_GREATERTHAN);
+  auto filter =
+    duckdb::make_shared_ptr<duckdb::DynamicFilterData>(comparison, duckdb::Value::BIGINT(0));
+  auto direction = ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING;
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, direction));
+  orders.push_back(make_order(1, direction));
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}),
+    std::move(orders),
+    2,
+    offset,
+    filter,
+    0);
+  sirius_physical_top_n_merge merge(&topn);
+  auto first = topn.execute(
+    pipelineable_operator_data({make_batch(*space, {10, 10, 10, 10}, {100, 101, 102, 103})}),
+    default_stream());
+  CHECK(filter->initialized == inclusive);
+  if (inclusive) CHECK(filter->constant.GetValue<int64_t>() == 10);
+
+  // Consume the published predicate before admitting the later batch to Top-N.
+  // Every later row ties on the first key but improves on the second key.
+  std::vector<int64_t> later_keys;
+  std::vector<int64_t> later_values;
+  for (int64_t i = 0; i < 4; ++i) {
+    if (!filter->initialized ||
+        duckdb::DynamicFilterData::CompareValue(
+          filter->comparison_type, filter->constant, duckdb::Value::BIGINT(10))) {
+      later_keys.push_back(10);
+      later_values.push_back(ascending ? i : 200 + i);
+    }
+  }
+  CHECK(later_keys.size() == 4);
+  auto second = topn.execute(
+    pipelineable_operator_data({make_batch(*space, later_keys, later_values)}), default_stream());
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (auto* data : {first.get(), second.get()}) {
+    auto const& batches = dynamic_cast<pipelineable_operator_data&>(*data).get_data_batches();
+    partials.insert(partials.end(), batches.begin(), batches.end());
+  }
+  auto result         = merge.execute(pipelineable_operator_data(partials), default_stream());
+  auto const& batches = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto view = sirius::get_cudf_table_view(*batches[0]);
+  CHECK(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>{10, 10});
+  auto start    = static_cast<int64_t>(offset);
+  auto expected = ascending ? std::vector<int64_t>{start, start + 1}
+                            : std::vector<int64_t>{203 - start, 202 - start};
+  CHECK(copy_column_to_host<int64_t>(view.column(1)) == expected);
+  CHECK(filter->initialized == inclusive);
+  CHECK(filter->comparison_type == comparison);
+}

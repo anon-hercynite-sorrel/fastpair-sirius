@@ -1,0 +1,9 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 256MiB
+    host:
+      # Four default I/O reactors use 256 MiB of staging; leave room for execution.
+      capacity_bytes: 512MiB

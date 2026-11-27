@@ -1,0 +1,898 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
+
+#include "cudf/cudf_utils.hpp"
+#include "data/data_batch_utils.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
+#include "expression/ast/utils.hpp"
+#include "helper/type_conversions.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/stddev.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
+#include "op/input_free_operator_data.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
+#include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
+
+#include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/types.hpp>
+#include <cudf/unary.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/resource_ref.hpp>
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+
+#include <limits>
+#include <optional>
+#include <unordered_set>
+
+namespace sirius {
+namespace op {
+
+sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+  std::size_t estimated_cardinality,
+  duckdb::TupleDataValidityType /*distinct_validity*/,
+  std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs_p)
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
+    aggregates(std::move(expressions)),
+    aggregate_input_max_abs(std::move(aggregate_input_max_abs_p))
+{
+  // COUNT(DISTINCT) uses COLLECT_SET. DistinctAggregateCollectionInfo and DistinctAggregateData
+  // are not populated.
+}
+
+namespace {
+
+// Map LogicalType to cudf::data_type using existing utility
+cudf::data_type to_cudf_type(const duckdb::LogicalType& t)
+{
+  auto const type = sirius::get_cudf_type(t);
+  if (!type) {
+    throw duckdb::InvalidInputException("Aggregate type %s cannot be mapped to cuDF", t.ToString());
+  }
+  return *type;
+}
+
+template <typename ScalarType>
+ScalarType const& scalar_cast(const cudf::scalar& s)
+{
+  return static_cast<ScalarType const&>(s);
+}
+
+template <typename ScalarType>
+ScalarType& scalar_cast(cudf::scalar& s)
+{
+  return static_cast<ScalarType&>(s);
+}
+
+template <typename T>
+std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type type,
+                                                             T value,
+                                                             ::cuda::stream_ref stream)
+{
+  auto out = cudf::make_numeric_scalar(type, stream);
+  scalar_cast<cudf::numeric_scalar<T>>(*out).set_value(value, stream);
+  return out;
+}
+
+enum class aggregate_kind {
+  SUM,
+  MIN,
+  MAX,
+  COUNT,
+  COUNT_DISTINCT,
+  COUNT_STAR,
+  AVG,
+  FIRST,
+  STDDEV_SAMP
+};
+
+struct aggregate_spec {
+  aggregate_kind kind;
+  int input_idx;
+  duckdb::LogicalType return_type;
+  size_t local_sum_idx;
+  size_t local_count_idx;
+  /// SUM or AVG that DuckDB accumulates in HUGEINT (is_wide_integer_sum). Its one-row partial
+  /// sum is DECIMAL128 with scale 0 so that the merge cannot overflow INT64.
+  bool wide_integer_sum = false;
+  /// The DuckDB result is HUGEINT, carried as DECIMAL128 with scale 0. An integer input reduced in
+  /// INT64 has its one-row partial widened to that carrier, so the merge sums DECIMAL128 partials.
+  bool returns_hugeint = false;
+  /// SUM or AVG over HUGEINT: its DECIMAL128 partials can approach 2^127, so the merge checks their
+  /// total cannot pass it.
+  bool sums_hugeint_input = false;
+};
+
+struct aggregate_layout {
+  std::vector<aggregate_spec> aggregates;
+  std::vector<duckdb::LogicalType> local_types;
+  std::vector<cudf::aggregation::Kind> merge_kinds;
+  std::vector<std::optional<cudf::size_type>>
+    merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
+  bool has_first          = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
+  bool has_stddev         = false;
+};
+
+/// The local (partial) sum type of a wide integer SUM or AVG: DECIMAL(38, 0), carried on the GPU
+/// as wide_integer_sum_type().
+duckdb::LogicalType wide_integer_partial_type()
+{
+  return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_DECIMAL, 0);
+}
+
+aggregate_layout build_aggregate_layout(
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& aggregates)
+{
+  aggregate_layout layout;
+  size_t local_idx = 0;
+  layout.aggregates.reserve(aggregates.size());
+
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    auto const& agg = sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
+    auto const& children = agg.arguments();
+    if (children.size() > 1) {
+      throw not_implemented_exception("Aggregates with multiple children not supported yet");
+    }
+    if (agg.distinct() && (agg.function() != sirius::aggregate_id::count || children.empty() ||
+                           !children[0]->is_reference())) {
+      throw not_implemented_exception(
+        "Distinct aggregates other than COUNT(DISTINCT col) "
+        "not supported in GPU path yet");
+    }
+
+    auto agg_return_type = sirius::to_duckdb(agg.return_type());
+    auto child_ref_index = [&]() { return children[0]->as_reference().column_index; };
+
+    aggregate_spec spec;
+    spec.input_idx       = -1;
+    spec.return_type     = agg_return_type;
+    spec.local_sum_idx   = std::numeric_limits<size_t>::max();
+    spec.local_count_idx = std::numeric_limits<size_t>::max();
+    spec.wide_integer_sum =
+      !children.empty() && is_wide_integer_sum(agg.function(), children[0]->return_type());
+    spec.returns_hugeint    = agg_return_type.id() == duckdb::LogicalTypeId::HUGEINT;
+    spec.sums_hugeint_input = (agg.function() == sirius::aggregate_id::sum ||
+                               agg.function() == sirius::aggregate_id::avg) &&
+                              !children.empty() &&
+                              children[0]->return_type().id() == sirius::type_id::HUGEINT;
+
+    switch (agg.function()) {
+      case sirius::aggregate_id::count_star:
+        spec.kind          = aggregate_kind::COUNT_STAR;
+        spec.return_type   = duckdb::LogicalType::BIGINT;
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::count:
+        if (children.empty()) {
+          throw not_implemented_exception("count() without arguments not supported");
+        }
+        spec.return_type   = duckdb::LogicalType::BIGINT;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.merge_nth_index.push_back(std::nullopt);
+        if (agg.distinct()) {
+          // Each batch collects its distinct values into a one-row LIST, the merge unions the
+          // lists and the finalize step counts the elements.
+          spec.kind = aggregate_kind::COUNT_DISTINCT;
+          layout.local_types.push_back(
+            duckdb::LogicalType::LIST(sirius::to_duckdb(children[0]->return_type())));
+          layout.merge_kinds.push_back(cudf::aggregation::Kind::MERGE_SETS);
+          layout.has_count_distinct = true;
+        } else {
+          spec.kind = aggregate_kind::COUNT;
+          layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+          layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        }
+        break;
+      case sirius::aggregate_id::sum:
+      case sirius::aggregate_id::sum_no_overflow:
+        if (children.empty()) {
+          throw not_implemented_exception("sum() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::SUM;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(spec.wide_integer_sum ? wide_integer_partial_type()
+                                                           : agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::min:
+        if (children.empty()) {
+          throw not_implemented_exception("min() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::MIN;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::MIN);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::max:
+        if (children.empty()) {
+          throw not_implemented_exception("max() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::MAX;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
+        layout.merge_nth_index.push_back(std::nullopt);
+        break;
+      case sirius::aggregate_id::avg: {
+        if (children.empty()) {
+          throw not_implemented_exception("avg() without arguments not supported");
+        }
+        spec.kind          = aggregate_kind::AVG;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        // AVG's local carrier is the input type, not AVG's final return type. Execution widens
+        // signed 8/16-bit inputs to INT64, DECIMAL inputs to DECIMAL(38, scale) and INTEGER,
+        // BIGINT and HUGEINT inputs (wide integer sums) to DECIMAL(38, 0) before or after
+        // reducing, so partial sums cannot overflow and merge without a cross-type reduction;
+        // keep the declared local schema on the same rule.
+        auto local_sum_type = sirius::to_duckdb(children[0]->return_type());
+        if (spec.wide_integer_sum) {
+          local_sum_type = wide_integer_partial_type();
+        } else if (local_sum_type.id() == duckdb::LogicalTypeId::TINYINT ||
+                   local_sum_type.id() == duckdb::LogicalTypeId::SMALLINT) {
+          local_sum_type = duckdb::LogicalType::BIGINT;
+        } else if (local_sum_type.id() == duckdb::LogicalTypeId::DECIMAL) {
+          local_sum_type = duckdb::LogicalType::DECIMAL(
+            duckdb::Decimal::MAX_WIDTH_DECIMAL, duckdb::DecimalType::GetScale(local_sum_type));
+        }
+        layout.local_types.push_back(std::move(local_sum_type));
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_avg = true;
+        break;
+      }
+      case sirius::aggregate_id::stddev_samp:
+        if (children.empty()) throw not_implemented_exception("stddev_samp() requires an argument");
+        spec.kind          = aggregate_kind::STDDEV_SAMP;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::STRUCT({}));
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::M2);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_stddev = true;
+        break;
+      case sirius::aggregate_id::first:
+        spec.kind          = aggregate_kind::FIRST;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(agg_return_type);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::NTH_ELEMENT);
+        layout.merge_nth_index.push_back(0);  // first element
+        // A NULL first row is a value; an empty partial has no first row.
+        spec.local_count_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_first = true;
+        break;
+      default:
+        throw not_implemented_exception(
+          "Aggregate not supported: {}",
+          std::string{sirius::to_duckdb_aggregate_name(agg.function())});
+    }
+
+    layout.aggregates.push_back(std::move(spec));
+  }
+
+  return layout;
+}
+
+std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
+                                              const cudf::column_view& count_view,
+                                              const duckdb::LogicalType& return_type,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref memory_resource)
+{
+  // The merged sum/count columns are already single-row, so divide them on-device
+  // rather than copying scalars to the host and converting through long double.
+  // This mirrors sirius_physical_grouped_aggregate_merge and avoids the precision
+  // loss of the host-side decimal->long double->decimal round trips.
+  auto out_type = to_cudf_type(return_type);
+
+  if (cudf::is_fixed_point(out_type)) {
+    // DECIMAL output: divide directly in fixed-point to preserve precision.
+    return cudf::binary_operation(
+      sum_view, count_view, cudf::binary_operator::DIV, out_type, stream, memory_resource);
+  }
+
+  // Non-DECIMAL output (typically DOUBLE): cast both operands to FLOAT64 and divide.
+  auto sum_f64 =
+    cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
+  auto count_f64 =
+    cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
+  auto avg_f64 = cudf::binary_operation(sum_f64->view(),
+                                        count_f64->view(),
+                                        cudf::binary_operator::DIV,
+                                        cudf::data_type{cudf::type_id::FLOAT64},
+                                        stream,
+                                        memory_resource);
+  if (out_type.id() == cudf::type_id::FLOAT64) { return avg_f64; }
+  // Defensive: cast to the requested numeric return type if it isn't already FLOAT64.
+  return cudf::cast(avg_f64->view(), out_type, stream, memory_resource);
+}
+
+std::unique_ptr<cudf::column> make_count_distinct_column(
+  const cudf::column_view& set_view,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref memory_resource)
+{
+  auto count = cudf::cast(
+    cudf::lists::count_elements(cudf::lists_column_view{set_view}, stream, memory_resource)->view(),
+    cudf::data_type{cudf::type_id::INT64},
+    stream,
+    memory_resource);
+  // COLLECT_SET over an empty or all-NULL input gives a NULL list, whose count is 0.
+  if (!count->has_nulls()) { return count; }
+  auto const zero =
+    make_numeric_scalar_with_value<int64_t>(cudf::data_type{cudf::type_id::INT64}, 0, stream);
+  return cudf::replace_nulls(count->view(), *zero, stream, memory_resource);
+}
+
+}  // namespace
+
+duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_local_output_types()
+  const
+{
+  aggregate_layout layout;
+  try {
+    layout = build_aggregate_layout(aggregates);
+  } catch (const not_implemented_exception&) {
+    // Keep unsupported aggregates on their established runtime-fallback path. Their local output
+    // is never consumed, so retaining the declared schema here avoids turning a runtime fallback
+    // into an earlier planning refusal merely to describe an output that will not be produced.
+    return types;
+  }
+  duckdb::vector<sirius::logical_type> local_types;
+  local_types.reserve(layout.local_types.size());
+  for (auto const& type : layout.local_types) {
+    local_types.push_back(sirius::from_duckdb(type));
+  }
+  return local_types;
+}
+
+std::size_t sirius_physical_ungrouped_aggregate::no_history_peak_memory_estimate(
+  const input_stats& stats) const
+{
+  // Empty inputs still allocate scalar results, validity masks and partial states.
+  // Allow sixteen RMM-aligned allocations per aggregate and input batch for fixed-width
+  // states, including STDDEV's three scalar states and temporary columns.
+  constexpr std::size_t rmm_allocation_alignment_bytes = 256;
+  constexpr std::size_t scalar_state_bytes             = 16 * rmm_allocation_alignment_bytes;
+  std::size_t state_units                              = aggregates.size();
+  // Account for offsets and child buffers as in the merge's empty-input estimate.
+  // Inspect local types: COUNT(DISTINCT) returns an integer but carries a LIST partial.
+  for (auto const& type : get_local_output_types()) {
+    if (type.is_varchar() || type.is_array() || type.id() == sirius::type_id::LIST) {
+      state_units = memory::saturating_add(state_units, std::size_t{2});
+    }
+  }
+  auto const partials =
+    memory::saturating_mul(state_units, std::max(stats.num_batches, std::size_t{1}));
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  memory::saturating_mul(partials, scalar_state_bytes));
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
+  if (aggregates.empty()) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
+
+  auto layout = build_aggregate_layout(aggregates);
+  std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
+  outputs.reserve(input_batches.size());
+
+  for (auto const& batch : input_batches) {
+    auto* space = batch.get_memory_space();
+    if (!space) { continue; }
+
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(layout.local_types.size());
+
+    // DECIMAL32/DECIMAL64 SUM and AVG inputs are summed over DECIMAL128 only if this batch could
+    // overflow the input width (see sums_to_widen); otherwise they are reduced at the input width
+    // and the one-row result is widened. A wide integer SUM or AVG needs no such gate: it is
+    // reduced in 128 bits in one pass (wide_integer_sum), so its one-row partial is an exact
+    // DECIMAL128 and the merge cannot overflow either.
+    std::unordered_set<int> widened_decimal_inputs;
+    {
+      std::vector<sum_candidate> candidates;
+      for (size_t k = 0; k < layout.aggregates.size(); ++k) {
+        auto const& spec = layout.aggregates[k];
+        // Only SUM (and AVG's SUM) is gated: MIN, MAX and COUNT cannot overflow, and no other
+        // overflow-prone kind (PRODUCT, SUM_OF_SQUARES) is reachable here.
+        if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
+        auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
+        if (!widened_decimal_sum_type(col_type)) { continue; }
+        candidates.push_back(
+          {spec.input_idx,
+           k < aggregate_input_max_abs.size() ? aggregate_input_max_abs[k] : std::nullopt});
+      }
+      if (!candidates.empty()) {
+        widened_decimal_inputs =
+          sums_to_widen(view, candidates, stream, space->get_default_allocator());
+      }
+    }
+    // DECIMAL128 SUM and AVG inputs whose values in this batch provably keep the sum within 64
+    // bits (see decimal_sums_to_narrow) are reduced over DECIMAL64 at the same scale, and the
+    // one-row partial is cast back to the input type, so the merge sees the same types as before
+    // and combines the partials at 128 bits.
+    std::unordered_set<int> narrowed_decimal_inputs;
+    {
+      std::vector<sum_candidate> candidates;
+      for (size_t k = 0; k < layout.aggregates.size(); ++k) {
+        auto const& spec = layout.aggregates[k];
+        if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
+        auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
+        if (!narrowed_decimal_sum_type(col_type)) { continue; }
+        candidates.push_back(
+          {spec.input_idx,
+           k < aggregate_input_max_abs.size() ? aggregate_input_max_abs[k] : std::nullopt});
+      }
+      if (!candidates.empty()) {
+        narrowed_decimal_inputs =
+          decimal_sums_to_narrow(view, candidates, stream, space->get_default_allocator());
+      }
+    }
+
+    for (auto const& spec : layout.aggregates) {
+      switch (spec.kind) {
+        case aggregate_kind::COUNT_STAR: {
+          auto scalar = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
+          break;
+        }
+        case aggregate_kind::COUNT: {
+          auto col    = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto agg_op = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+          auto scalar =
+            cudf::reduce(col, *agg_op, cudf::data_type(cudf::type_id::INT64), std::nullopt, stream);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
+          break;
+        }
+        case aggregate_kind::COUNT_DISTINCT: {
+          auto const mr = space->get_default_allocator();
+          auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto agg_op   = cudf::make_collect_set_aggregation<cudf::reduce_aggregation>(
+            cudf::null_policy::EXCLUDE, cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL);
+          auto scalar = cudf::reduce(
+            col, *agg_op, cudf::data_type{cudf::type_id::LIST}, std::nullopt, stream, mr);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
+          break;
+        }
+        case aggregate_kind::STDDEV_SAMP: {
+          cols.push_back(local_stddev_state(
+            view.column(spec.input_idx), stream, space->get_default_allocator()));
+          break;
+        }
+        case aggregate_kind::FIRST: {
+          auto col = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          std::unique_ptr<cudf::scalar> first_scalar;
+          if (col.size() == 0) {
+            // FIRST over an empty input is NULL. make_fixed_width_scalar throws on
+            // non-fixed-width types (e.g. STRING), so build a typed, invalid scalar
+            // that works for any column type.
+            first_scalar = cudf::make_default_constructed_scalar(
+              col.type(), stream, cudf::get_current_device_resource_ref());
+            first_scalar->set_valid_async(false, stream);
+          } else {
+            first_scalar =
+              cudf::get_element(col, 0, stream, cudf::get_current_device_resource_ref());
+          }
+          cols.push_back(cudf::make_column_from_scalar(*first_scalar, 1, stream));
+          auto count = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*count, 1, stream));
+          break;
+        }
+        case aggregate_kind::SUM:
+        case aggregate_kind::MIN:
+        case aggregate_kind::MAX:
+        case aggregate_kind::AVG: {
+          auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto out_type = to_cudf_type(spec.return_type);
+          std::unique_ptr<cudf::reduce_aggregation> agg_op;
+          if (spec.kind == aggregate_kind::MIN) {
+            agg_op = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+          } else if (spec.kind == aggregate_kind::MAX) {
+            agg_op = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+          } else {
+            agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+          }
+          // cuDF requires output type == input type for fixed-point (decimal) reductions.
+          // For AVG we apply the return type in the merge step (SUM/COUNT).
+          // For SUM and AVG, decimals that could overflow the input width in this batch are
+          // widened before the aggregation. Otherwise the reduction runs at the input width and
+          // the one-row partial is widened to DECIMAL128 afterwards. A DECIMAL128 input that fits
+          // 64 bits in this batch is reduced over DECIMAL64 and its partial cast back.
+          bool is_decimal = cudf::is_fixed_point(col.type());
+
+          std::unique_ptr<cudf::column> casted_col;
+          std::optional<cudf::data_type> widen_partial_to;
+          std::unique_ptr<cudf::column> partial;
+          if (spec.wide_integer_sum) {
+            // INTEGER or BIGINT: aggregate inputs keep their native carriers, and
+            // wide_integer_sum rejects any other type.
+            partial = wide_integer_sum(col, stream, space->get_default_allocator());
+          } else {
+            if (spec.returns_hugeint && !is_decimal) {
+              // cuDF cannot reduce integers into a decimal: sum_no_overflow and SMALLINT or
+              // BOOLEAN inputs are reduced in INT64 and the partial widened to HUGEINT's carrier.
+              out_type         = cudf::data_type{cudf::type_id::INT64};
+              widen_partial_to = wide_integer_sum_type();
+            }
+            if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
+              if (col.type().id() == cudf::type_id::DECIMAL32 ||
+                  col.type().id() == cudf::type_id::DECIMAL64) {
+                auto const wide = cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale());
+                if (widened_decimal_inputs.contains(static_cast<int>(spec.input_idx))) {
+                  casted_col = cudf::cast(col, wide, stream, space->get_default_allocator());
+                  col        = casted_col->view();
+                } else {
+                  widen_partial_to = wide;
+                }
+              } else if (narrowed_decimal_inputs.contains(static_cast<int>(spec.input_idx))) {
+                widen_partial_to = col.type();
+                casted_col       = cudf::cast(col,
+                                        *narrowed_decimal_sum_type(col.type()),
+                                        stream,
+                                        space->get_default_allocator());
+                col              = casted_col->view();
+              }
+            }
+            if (is_decimal) {
+              // cuDF requires output type == input type for fixed-point reductions.
+              out_type = col.type();
+            } else if (spec.kind == aggregate_kind::AVG) {
+              // Widen small integer types to INT64 so the partial sum is stored as INT64.
+              // merge_ungrouped_aggregate sums INT64 partial sums without cross-type reduction,
+              // which avoids cuDF cross-type reduce issues that produce wrong results.
+              if (col.type().id() == cudf::type_id::INT8 ||
+                  col.type().id() == cudf::type_id::INT16 ||
+                  col.type().id() == cudf::type_id::INT32) {
+                casted_col = cudf::cast(col, cudf::data_type(cudf::type_id::INT64), stream);
+                col        = casted_col->view();
+              }
+              out_type = col.type();
+            }
+            auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
+            partial     = cudf::make_column_from_scalar(*scalar, 1, stream);
+            if (widen_partial_to) {
+              partial = cudf::cast(
+                partial->view(), *widen_partial_to, stream, space->get_default_allocator());
+            }
+          }
+          cols.push_back(std::move(partial));
+          if (spec.kind == aggregate_kind::AVG) {
+            // AVG denominator is the count of non-null values (SUM skips NULLs).
+            // No NULLs -> row count suffices, so avoid the extra COUNT reduction.
+            std::unique_ptr<cudf::scalar> count_scalar;
+            if (!col.nullable() || col.null_count() == 0) {
+              count_scalar =
+                make_numeric_scalar_with_value<int64_t>(cudf::data_type{cudf::type_id::INT64},
+                                                        static_cast<int64_t>(view.num_rows()),
+                                                        stream);
+            } else {
+              auto count_agg = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+              count_scalar   = cudf::reduce(
+                col, *count_agg, cudf::data_type{cudf::type_id::INT64}, std::nullopt, stream);
+            }
+            cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
+          }
+          break;
+        }
+      }
+    }
+
+    auto out_table = std::make_unique<cudf::table>(std::move(cols));
+    // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
+    // on `stream`; the constructor records the writer event for downstream
+    // cross-device readers.
+    auto out_repr =
+      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+    std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+    auto const batch_id                                          = ::sirius::get_next_batch_id();
+    outputs.push_back(cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
+  }
+
+  return std::make_unique<pipelineable_operator_data>(outputs);
+}
+
+// Helper to deep copy the aggregate AST expressions (used by the merge overload below).
+static duckdb::vector<std::unique_ptr<sirius::ast::node>> copy_expressions(
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& src)
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> result;
+  result.reserve(src.size());
+  for (const auto& expr : src) {
+    // Deep-clone the move-only expression tree, including aggregate children.
+    if (expr == nullptr) {
+      throw not_implemented_exception("copy_expressions: cannot clone a null aggregate expression");
+    }
+    result.push_back(sirius::ast::clone(*expr));
+  }
+  return result;
+}
+
+sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
+  sirius_physical_ungrouped_aggregate* ungrouped_aggregate)
+  : sirius_physical_ungrouped_aggregate_merge(
+      ungrouped_aggregate->types,                         // copied by value
+      copy_expressions(ungrouped_aggregate->aggregates),  // deep copy
+      ungrouped_aggregate->estimated_cardinality,
+      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default - not stored in source
+{
+  child_op = ungrouped_aggregate;
+}
+
+sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
+  std::size_t estimated_cardinality,
+  duckdb::TupleDataValidityType /*distinct_validity*/)
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::MERGE_AGGREGATE, std::move(types), estimated_cardinality),
+    aggregates(std::move(expressions))
+{
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
+  if (aggregates.empty()) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
+
+  if (auto const* empty = dynamic_cast<input_free_operator_data const*>(&input_data)) {
+    auto const layout = build_aggregate_layout(aggregates);
+    auto& space       = empty->get_gpu_memory_space();
+    auto const mr     = space.get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(layout.aggregates.size());
+    for (std::size_t i = 0; i < layout.aggregates.size(); ++i) {
+      auto const kind = layout.aggregates[i].kind;
+      auto const physical_type =
+        has_physical_overrides() ? get_physical_types()[i] : sirius::require_cudf_type(types[i]);
+      if (kind == aggregate_kind::COUNT_STAR || kind == aggregate_kind::COUNT ||
+          kind == aggregate_kind::COUNT_DISTINCT) {
+        auto zero = sirius::make_constant_column<int64_t>(0, 1, stream, mr);
+        if (zero->type() != physical_type) {
+          zero = cudf::cast(zero->view(), physical_type, stream, mr);
+        }
+        columns.push_back(std::move(zero));
+      } else if (cudf::is_fixed_width(physical_type)) {
+        columns.push_back(
+          cudf::make_fixed_width_column(physical_type, 1, cudf::mask_state::ALL_NULL, stream, mr));
+      } else {
+        auto prototype = sirius::make_empty_table(duckdb::vector<sirius::logical_type>{types[i]});
+        columns.push_back(sirius::make_null_column(prototype->view().column(0), 1, stream, mr));
+      }
+    }
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{
+        sirius::make_data_batch(std::move(table), space, stream, batch_telemetry())});
+  }
+
+  auto const& input  = dynamic_cast<pipelineable_operator_data const&>(input_data);
+  auto input_batches = input.get_read_only_batches();
+  if (input_batches.empty()) {
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] empty input must arrive as "
+      "input_free_operator_data");
+  }
+
+  cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
+  if (space == nullptr) {
+    throw sirius::internal_exception(
+      "[sirius_physical_ungrouped_aggregate_merge::execute] input batch has no memory space");
+  }
+
+  auto layout = build_aggregate_layout(aggregates);
+  std::shared_ptr<cucascade::data_batch> merged_batch;
+  if (input_batches.size() == 1) {
+    merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
+  } else {
+    std::vector<std::optional<cudf::size_type>> first_row_counts(layout.local_types.size());
+    for (auto const& spec : layout.aggregates) {
+      if (spec.kind == aggregate_kind::FIRST)
+        first_row_counts[spec.local_sum_idx] = spec.local_count_idx;
+    }
+    // cuDF's SUM wraps past 128 bits; a HUGEINT input's partials can get there.
+    for (auto const& spec : layout.aggregates) {
+      if (!spec.sums_hugeint_input) { continue; }
+      std::vector<cudf::column_view> partials;
+      for (auto const& batch : input_batches) {
+        partials.push_back(
+          batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view().column(
+            static_cast<cudf::size_type>(spec.local_sum_idx)));
+      }
+      require_decimal128_partial_sums_in_range(partials, stream, space->get_default_allocator());
+    }
+    merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(input_batches,
+                                                             layout.merge_kinds,
+                                                             layout.merge_nth_index,
+                                                             stream,
+                                                             *space,
+                                                             batch_telemetry(),
+                                                             first_row_counts);
+  }
+
+  if (!layout.has_first && !layout.has_avg && !layout.has_stddev && !layout.has_count_distinct) {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
+  }
+
+  // Acquire read access to merged batch to extract table
+  auto merged_ro = merged_batch->to_read_only();
+  auto merged_view =
+    merged_ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+
+  std::vector<std::unique_ptr<cudf::column>> output_cols;
+  output_cols.reserve(layout.aggregates.size());
+  for (auto const& spec : layout.aggregates) {
+    if (spec.kind == aggregate_kind::AVG) {
+      auto const& sum_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      auto const& count_view =
+        merged_view.column(static_cast<cudf::size_type>(spec.local_count_idx));
+      output_cols.push_back(make_avg_column(
+        sum_view, count_view, spec.return_type, stream, cudf::get_current_device_resource_ref()));
+    } else if (spec.kind == aggregate_kind::COUNT_DISTINCT) {
+      auto const& set_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      output_cols.push_back(
+        make_count_distinct_column(set_view, stream, space->get_default_allocator()));
+    } else if (spec.kind == aggregate_kind::STDDEV_SAMP) {
+      output_cols.push_back(finalize_stddev(
+        merged_view.column(spec.local_sum_idx), stream, space->get_default_allocator()));
+    } else {
+      auto const& col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));
+    }
+  }
+
+  auto out_table = std::make_unique<cudf::table>(
+    std::move(output_cols), stream, cudf::get_current_device_resource_ref());
+  // STREAM-LINEAGE: cudf::table ctor + make_avg_column write on `stream`;
+  // the constructor records the writer event for downstream cross-device
+  // readers.
+  auto out_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
+  std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  auto output_batch                                            = cucascade::data_batch::make(
+    batch_id,
+    std::move(output_data),
+    telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+}
+
+std::optional<task_creation_hint> sirius_physical_ungrouped_aggregate_merge::get_next_task_hint()
+{
+  if (ports.empty() || _task_claimed.load(std::memory_order_acquire)) { return std::nullopt; }
+  for (auto const& [name, port] : ports) {
+    if (port->src_pipeline && !port->src_pipeline->is_pipeline_finished()) {
+      auto source    = port->src_pipeline->get_source();
+      auto* producer = source ? source.get() : &port->src_pipeline->get_operators().front().get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
+  }
+  bool expected = false;
+  if (!_task_claimed.compare_exchange_strong(expected, true)) { return std::nullopt; }
+  return task_creation_hint{TaskCreationHint::READY, this};
+}
+
+bool sirius_physical_ungrouped_aggregate_merge::all_ports_empty()
+{
+  return _input_handed_out.load(std::memory_order_acquire);
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+{
+  std::lock_guard<std::mutex> guard(lock);
+  if (!_task_claimed.load(std::memory_order_acquire) ||
+      _input_handed_out.load(std::memory_order_acquire) || !is_source_pipeline_finished()) {
+    return nullptr;
+  }
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& [name, port] : ports) {
+    if (!port->repo) { continue; }
+    while (auto batch = port->repo->pop_next_data_batch()) {
+      batches.push_back(std::move(batch));
+    }
+  }
+  std::unique_ptr<operator_data> input;
+  if (batches.empty()) {
+    input = std::make_unique<input_free_operator_data>(empty_input_size_estimate());
+  } else {
+    input = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  }
+  _input_handed_out.store(true, std::memory_order_release);
+  return input;
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::empty_input_size_estimate() const
+{
+  // Per-column allowance includes masks, nested offsets, and allocation rounding.
+  std::size_t columns = types.size();
+  for (auto const& type : types) {
+    if (type.is_array() || type.is_varchar()) { columns = memory::saturating_add(columns, 2); }
+  }
+  return std::max(memory::saturating_mul(columns, std::size_t{4096}), std::size_t{1} << 20);
+}
+
+std::size_t sirius_physical_ungrouped_aggregate_merge::no_history_peak_memory_estimate(
+  input_stats const& stats) const
+{
+  auto const ordinary = sirius_physical_operator::no_history_peak_memory_estimate(stats);
+  return stats.type == operator_data_type::INPUT_FREE
+           ? std::max(ordinary, empty_input_size_estimate())
+           : ordinary;
+}
+
+}  // namespace op
+}  // namespace sirius

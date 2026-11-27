@@ -1,0 +1,2629 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "utils/cudf_test_utils.hpp"
+#include "utils/mock_test_utils.hpp"
+#include "utils/range_test_utils.hpp"
+
+#include <cucascade/cuda/stream.hpp>
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
+#include <cucascade/cudf/host_table_packed.hpp>
+#include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
+
+#include <rmm/aligned.hpp>
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <catch2/catch_all.hpp>
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <memory>
+#include <span>
+#include <vector>
+
+using namespace cucascade;
+using cucascade::test::create_conversion_test_configs;
+using cucascade::test::create_simple_cudf_table;
+using cucascade::test::make_mock_memory_space;
+
+// Note: Tests that require mock host_table_packed_allocation are disabled because
+// fixed_size_host_memory_resource::multiple_blocks_allocation is now private.
+// The real allocation tests below use actual memory resources.
+[[maybe_unused]] static constexpr bool MOCK_HOST_ALLOCATION_DISABLED = true;
+
+// =============================================================================
+// host_data_packed_representation Tests
+// =============================================================================
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("host_data_packed_representation Construction", "[cpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("host_data_packed_representation get_size_in_bytes",
+          "[cpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("host_data_packed_representation memory tier", "[cpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("host_data_packed_representation device_id", "[cpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+TEST_CASE("host_data_packed_representation converts to GPU and preserves contents",
+          "[cpu_data_representation][gpu_data_representation]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+
+  // Start from a known cudf table; pack it and build a host_data_packed_representation
+  // Use the same stream for table creation and packing to avoid stream-ordered races
+  rmm::cuda_stream pack_stream;
+  auto original = create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), pack_stream);
+  auto view     = original.view();
+  auto packed   = cudf::pack(view, pack_stream);
+  pack_stream.synchronize();
+  auto host_mr = host_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  REQUIRE(host_mr != nullptr);
+
+  // Copy device buffer to host allocation
+  auto allocation         = host_mr->allocate_multiple_blocks(packed.gpu_data->size());
+  size_t copied           = 0;
+  size_t block_idx        = 0;
+  size_t block_off        = 0;
+  const size_t block_size = allocation->block_size();
+  while (copied < packed.gpu_data->size()) {
+    size_t remain = packed.gpu_data->size() - copied;
+    size_t bytes  = std::min(remain, block_size - block_off);
+    void* dst_ptr = reinterpret_cast<uint8_t*>((*allocation)[block_idx].data()) + block_off;
+    CUCASCADE_CUDA_TRY(cudaMemcpy(dst_ptr,
+                                  static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
+                                  bytes,
+                                  cudaMemcpyDeviceToHost));
+    copied += bytes;
+    block_off += bytes;
+    if (block_off == block_size) {
+      block_off = 0;
+      block_idx++;
+    }
+  }
+
+  auto meta_copy  = std::make_unique<std::vector<uint8_t>>(*packed.metadata);
+  auto host_alloc = std::make_unique<memory::host_table_packed_allocation>(
+    std::move(allocation), std::move(meta_copy), packed.gpu_data->size());
+  host_data_packed_representation host_repr(std::move(host_alloc),
+                                            const_cast<memory::memory_space*>(host_space));
+
+  // Convert to GPU and compare cudf tables
+  auto gpu_stream = gpu_space->acquire_stream();
+  auto gpu_any    = registry.convert<gpu_table_representation>(host_repr, gpu_space, pack_stream);
+  pack_stream.synchronize();
+  auto& gpu_repr = *gpu_any;
+  // Compare using the same stream used for conversion to avoid cross-stream hazards
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    original, gpu_repr.get_table_view(), pack_stream);
+}
+
+// =============================================================================
+// gpu_table_representation Tests
+// =============================================================================
+
+TEST_CASE("gpu_table_representation Construction", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  REQUIRE(repr.get_current_tier() == memory::Tier::GPU);
+  REQUIRE(repr.get_device_id() == 0);
+  REQUIRE(repr.get_size_in_bytes() > 0);
+}
+
+TEST_CASE("gpu_table_representation records a writer event only for a known writer stream",
+          "[gpu_data_representation][writer_event]")
+{
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+
+  auto make_owned = [&](::cuda::stream_ref writer_stream) {
+    return std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{}),
+      *gpu_space,
+      writer_stream);
+  };
+  auto make_view_backed = [&](::cuda::stream_ref writer_stream) {
+    auto owner      = std::make_shared<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+    auto const view = owner->view();
+    auto const alloc_size = owner->alloc_size();
+    return std::make_unique<gpu_table_representation>(
+      view, std::move(owner), alloc_size, *gpu_space, writer_stream);
+  };
+
+  SECTION("a null handle leaves the writer unknown until record_writer_event()")
+  {
+    auto const null_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+    auto owned             = make_owned(null_stream);
+    auto view_backed       = make_view_backed(null_stream);
+    REQUIRE(owned->get_writer_event() == nullptr);
+    REQUIRE(view_backed->get_writer_event() == nullptr);
+
+    // An explicit call records on the default stream instead.
+    owned->record_writer_event(null_stream);
+    REQUIRE(owned->get_writer_event() != nullptr);
+  }
+
+  SECTION("the legacy and per-thread default streams are known writers")
+  {
+    for (auto const writer_stream :
+         {::cuda::stream_ref{cudaStreamLegacy}, ::cuda::stream_ref{cudaStreamPerThread}}) {
+      CAPTURE(writer_stream.get());
+      REQUIRE(make_owned(writer_stream)->get_writer_event() != nullptr);
+      REQUIRE(make_view_backed(writer_stream)->get_writer_event() != nullptr);
+    }
+  }
+}
+
+TEST_CASE("gpu_table_representation clone on the default stream records the clone's writer",
+          "[gpu_data_representation][clone][writer_event]")
+{
+  rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{0}};
+  auto gpu_space            = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto const default_stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+
+  auto table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+  gpu_table_representation source(
+    std::make_unique<cudf::table>(std::move(table)), *gpu_space, default_stream);
+  REQUIRE(source.get_writer_event() == nullptr);
+
+  auto cloned = source.clone(default_stream);
+  REQUIRE(cloned->get_writer_event() != nullptr);
+  REQUIRE(source.get_writer_event() == nullptr);
+
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    source.get_table_view(),
+    cloned->cast<gpu_table_representation>().get_table_view(),
+    default_stream);
+}
+
+TEST_CASE("gpu_table_representation get_size_in_bytes", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+
+  SECTION("100 rows")
+  {
+    auto table = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    // Size should be at least 100 rows * (4 bytes for INT32 + 8 bytes for INT64)
+    std::size_t expected_min_size = 100 * (4 + 8);
+    REQUIRE(repr.get_size_in_bytes() >= expected_min_size);
+  }
+
+  SECTION("1000 rows")
+  {
+    auto table = create_simple_cudf_table(1000, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    // Size should be at least 1000 rows * (4 bytes for INT32 + 8 bytes for INT64)
+    std::size_t expected_min_size = 1000 * (4 + 8);
+    REQUIRE(repr.get_size_in_bytes() >= expected_min_size);
+  }
+
+  SECTION("Empty table")
+  {
+    auto table = create_simple_cudf_table(0, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    REQUIRE(repr.get_size_in_bytes() == 0);
+  }
+}
+
+TEST_CASE("gpu_table_representation get_table", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+
+  // Store the number of columns before moving the table
+  auto num_columns = table.num_columns();
+
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  const cudf::table_view& retrieved_table = repr.get_table_view();
+  REQUIRE(retrieved_table.num_columns() == num_columns);
+  REQUIRE(retrieved_table.num_rows() == 100);
+}
+
+TEST_CASE("gpu_table_representation memory tier", "[gpu_data_representation]")
+{
+  SECTION("GPU tier")
+  {
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    REQUIRE(repr.get_current_tier() == memory::Tier::GPU);
+  }
+}
+
+TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
+{
+  SECTION("Device 0")
+  {
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    REQUIRE(repr.get_device_id() == 0);
+  }
+
+  SECTION("Device 1")
+  {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+      SUCCEED("Single GPU or CUDA not available; skipping device 1 section");
+      return;
+    }
+
+    rmm::cuda_set_device_raii const pin_device{rmm::cuda_device_id{1}};
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 1);
+    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    REQUIRE(repr.get_device_id() == 1);
+  }
+}
+
+TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_representation]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  // Use one stream for table creation and both conversions to enforce order
+  // and avoid stream-ordered races
+  auto chain_stream = gpu_space->acquire_stream();
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                chain_stream);
+
+  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
+  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+
+  auto& back = *gpu_any;
+  chain_stream.sync();
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), back.get_table_view(), chain_stream);
+  // Stream is automatically managed - no explicit release needed
+}
+
+// =============================================================================
+// Multi-GPU Cross-Device Conversion Test
+// =============================================================================
+static std::unique_ptr<memory::memory_reservation_manager> create_multi_gpu_manager(int dev_a,
+                                                                                    int dev_b)
+{
+  using namespace cucascade::memory;
+  constexpr std::size_t capacity = 2048ull * 1024 * 1024;
+  std::vector<memory_space_config> configs;
+  configs.emplace_back(gpu_memory_space_config{.device_id = dev_a, .memory_capacity = capacity});
+  configs.emplace_back(gpu_memory_space_config{.device_id = dev_b, .memory_capacity = capacity});
+  return std::make_unique<memory_reservation_manager>(std::move(configs));
+}
+
+// A distinct value per row, so a shifted, truncated, or partly stale copy cannot match.
+template <typename T>
+static std::vector<T> make_row_pattern(std::size_t rows, std::uint64_t seed)
+{
+  std::vector<T> values(rows);
+  for (std::size_t row = 0; row < rows; ++row) {
+    values[row] = static_cast<T>((static_cast<std::uint64_t>(row) * 0x9E3779B97F4A7C15ull) ^ seed);
+  }
+  return values;
+}
+
+template <typename T>
+static std::unique_ptr<cudf::column> make_column_from_host(std::vector<T> const& values,
+                                                           rmm::device_async_resource_ref mr,
+                                                           ::cuda::stream_ref stream)
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_to_id<T>()},
+                                          static_cast<cudf::size_type>(values.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                                     values.data(),
+                                     values.size() * sizeof(T),
+                                     cudaMemcpyHostToDevice,
+                                     stream.get()));
+  return column;
+}
+
+// Reads on the owning device, so the copy does not depend on peer access to the column's pool.
+template <typename T>
+static std::vector<T> copy_column_to_host(cudf::column_view const& column, int device)
+{
+  rmm::cuda_set_device_raii select_owner{rmm::cuda_device_id{device}};
+  std::vector<T> values(static_cast<std::size_t>(column.size()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemcpy(values.data(), column.data<T>(), values.size() * sizeof(T), cudaMemcpyDefault));
+  return values;
+}
+
+// The converter's copy route depends on whether the pools are granted to each other, so the test
+// covers both the ungranted pools that cuCascade creates and pools granted by the application.
+TEST_CASE("gpu cross-device conversion copies every byte in both directions",
+          "[gpu_data_representation][gpu][.multi-device]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    SKIP("requires two available CUDA devices");
+  }
+  auto const source      = GENERATE(0, 1);
+  auto const destination = 1 - source;
+  auto const grant_pools = GENERATE(false, true);
+  CAPTURE(source, destination, grant_pools);
+
+  auto mgr = create_multi_gpu_manager(0, 1);
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  const memory::memory_space* src_space = mgr->get_memory_space(memory::Tier::GPU, source);
+  const memory::memory_space* dst_space = mgr->get_memory_space(memory::Tier::GPU, destination);
+  REQUIRE(src_space != nullptr);
+  REQUIRE(dst_space != nullptr);
+  if (grant_pools) {
+    for (auto const* owner : {src_space, dst_space}) {
+      auto const pool = owner->get_memory_resource_of<memory::Tier::GPU>()->pool_handle();
+      if (pool == nullptr) { SKIP("the memory space does not expose its CUDA pool"); }
+      auto const accessor = owner == src_space ? destination : source;
+      if (!memory::grant_pool_peer_access(pool, owner->get_device_id(), accessor).granted()) {
+        SKIP("pool peer access was not granted on this hardware");
+      }
+    }
+  }
+
+  // More than one 1 MiB host staging block per column, with a partial final block.
+  constexpr std::size_t rows = (1u << 18) + 3;
+  auto const wide            = make_row_pattern<std::int64_t>(rows, 0x0123456789ABCDEFull);
+  auto const narrow          = make_row_pattern<std::int32_t>(rows, 0xFEDCBA98ull);
+
+  rmm::cuda_set_device_raii select_source{rmm::cuda_device_id{source}};
+  auto xfer_stream = src_space->acquire_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_column_from_host(wide, src_space->get_default_allocator(), xfer_stream));
+  columns.push_back(make_column_from_host(narrow, src_space->get_default_allocator(), xfer_stream));
+  gpu_table_representation src_repr(std::make_unique<cudf::table>(std::move(columns)),
+                                    *const_cast<memory::memory_space*>(src_space),
+                                    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto dst_any = registry.convert<gpu_table_representation>(src_repr, dst_space, xfer_stream);
+  xfer_stream.sync();
+
+  REQUIRE(dst_any->get_device_id() == destination);
+  auto const view = dst_any->get_table_view();
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == static_cast<cudf::size_type>(rows));
+  CHECK(cucascade::test::first_mismatch(
+          copy_column_to_host<std::int64_t>(view.column(0), destination), wide) == rows);
+  CHECK(cucascade::test::first_mismatch(
+          copy_column_to_host<std::int32_t>(view.column(1), destination), narrow) == rows);
+}
+
+// =============================================================================
+// gpu_table_representation built from cudf::table_view + shared_ptr<cudf::table>
+// =============================================================================
+
+TEST_CASE("gpu->host_packed->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  auto chain_stream = gpu_space->acquire_stream();
+  auto table = create_simple_cudf_table(100, 2, gpu_space->get_default_allocator(), chain_stream);
+
+  auto shared_table = std::make_shared<cudf::table>(std::move(table));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(view,
+                                std::move(shared_table),
+                                alloc_size,
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto cpu_any = registry.convert<host_data_packed_representation>(repr, host_space, chain_stream);
+  auto gpu_any = registry.convert<gpu_table_representation>(*cpu_any, gpu_space, chain_stream);
+
+  chain_stream.sync();
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), gpu_any->get_table_view(), chain_stream);
+}
+
+TEST_CASE("gpu->host_fast->gpu roundtrip preserves contents (table_view+shared_ptr ctor)",
+          "[gpu_data_representation][table_view_ctor]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  rmm::cuda_stream stream;
+  constexpr int N = 64;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto shared_table = std::make_shared<cudf::table>(std::move(cols));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(view,
+                                std::move(shared_table),
+                                alloc_size,
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto host = registry.convert<host_data_representation>(repr, host_space, stream);
+  auto back = registry.convert<gpu_table_representation>(*host, gpu_space, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == N);
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(), back->get_table_view(), stream);
+}
+
+TEST_CASE("HOST converter draws from caller reservation (no double-count)",
+          "[cpu_data_representation][gpu_data_representation][reservation]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+
+  auto* host_mr = host_space->get_memory_resource_as<memory::fixed_size_host_memory_resource>();
+  REQUIRE(host_mr != nullptr);
+
+  // Build a GPU table large enough that a double-count would be unmistakable.
+  rmm::cuda_stream stream;
+  constexpr cudf::size_type num_rows = 1 << 20;  // ~4 MiB of INT32 payload
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       num_rows,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, num_rows * sizeof(int32_t), stream.value()));
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto shared_table = std::make_shared<cudf::table>(std::move(cols));
+  auto view         = shared_table->view();
+  auto alloc_size   = shared_table->alloc_size();
+  gpu_table_representation repr(view,
+                                std::move(shared_table),
+                                alloc_size,
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  stream.synchronize();
+
+  // The converter rounds the host allocation up to the block size, so reserve that
+  // much plus one block of headroom to guarantee the conversion fits entirely inside
+  // the reservation (the upstream_tracked_bytes == 0 branch) even if its planned
+  // layout size differs from cudf's alloc_size by alignment padding.
+  const std::size_t block_size    = host_mr->get_block_size();
+  const std::size_t reserve_bytes = rmm::align_up(alloc_size, block_size) + block_size;
+
+  const std::size_t committed_before = host_mr->get_total_allocated_bytes();
+
+  // Reserve N up front -- this commits ~N against the pool capacity counter.
+  std::unique_ptr<memory::reservation> res =
+    const_cast<memory::memory_space*>(host_space)->make_reservation_or_null(reserve_bytes);
+  REQUIRE(res != nullptr);
+
+  const std::size_t committed_after_reserve = host_mr->get_total_allocated_bytes();
+  REQUIRE(committed_after_reserve - committed_before >= alloc_size);
+
+  // Convert GPU -> HOST via the reservation overload, so the target space is derived from the
+  // reservation and the allocation draws it down. This must NOT throw rmm::out_of_memory and
+  // must NOT commit a second N.
+  std::unique_ptr<host_data_representation> host_rep;
+  REQUIRE_NOTHROW(host_rep = registry.convert<host_data_representation>(repr, *res, stream));
+  stream.synchronize();
+  REQUIRE(host_rep != nullptr);
+
+  // Total committed bytes after the conversion must stay ~= the reservation (N),
+  // NOT ~2N. Allow only block-size rounding slack on top of the reservation.
+  const std::size_t committed_after_convert = host_mr->get_total_allocated_bytes();
+  const std::size_t reservation_commit      = committed_after_reserve - committed_before;
+  const std::size_t conversion_extra        = committed_after_convert - committed_after_reserve;
+
+  // The conversion fits inside the reservation, so it must add (essentially) nothing.
+  CHECK(conversion_extra <= block_size);
+  // Guard against the double-count: total committed must be far below 2N.
+  CHECK(committed_after_convert < committed_before + 2 * reservation_commit);
+}
+
+// =============================================================================
+// idata_representation Interface Tests
+// =============================================================================
+
+TEST_CASE("idata_representation cast functionality",
+          "[cpu_data_representation][gpu_data_representation]")
+{
+  // Note: host_data_packed_representation section disabled - requires internal API access
+
+  SECTION("Cast gpu_table_representation")
+  {
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    idata_representation* base_ptr = &repr;
+
+    // Cast to derived type
+    gpu_table_representation& casted = base_ptr->cast<gpu_table_representation>();
+    REQUIRE(&casted == &repr);
+    REQUIRE(casted.get_table_view().num_rows() == 100);
+  }
+}
+
+TEST_CASE("idata_representation const cast functionality",
+          "[cpu_data_representation][gpu_data_representation]")
+{
+  // Note: host_data_packed_representation section disabled - requires internal API access
+
+  SECTION("Const cast gpu_table_representation")
+  {
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+    auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                  *gpu_space,
+                                  ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    const idata_representation* base_ptr = &repr;
+
+    // Const cast to derived type
+    const gpu_table_representation& casted = base_ptr->cast<gpu_table_representation>();
+    REQUIRE(&casted == &repr);
+    REQUIRE(casted.get_table_view().num_rows() == 100);
+  }
+}
+
+// =============================================================================
+// Cross-Tier Comparison Tests
+// =============================================================================
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("Compare CPU and GPU representations",
+          "[cpu_data_representation][gpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+TEST_CASE("Multiple representations on same memory space",
+          "[cpu_data_representation][gpu_data_representation]")
+{
+  // Note: host_data_packed_representation section disabled - requires internal API access
+
+  SECTION("Multiple GPU representations")
+  {
+    auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+
+    auto table1 = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+    gpu_table_representation repr1(std::make_unique<cudf::table>(std::move(table1)),
+                                   *gpu_space,
+                                   ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    auto table2 = create_simple_cudf_table(200, gpu_space->get_default_allocator());
+    gpu_table_representation repr2(std::make_unique<cudf::table>(std::move(table2)),
+                                   *gpu_space,
+                                   ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+    REQUIRE(repr1.get_current_tier() == repr2.get_current_tier());
+    REQUIRE(repr1.get_device_id() == repr2.get_device_id());
+    // Different row counts should result in different sizes
+    REQUIRE(repr1.get_size_in_bytes() != repr2.get_size_in_bytes());
+  }
+}
+
+// =============================================================================
+// Edge Case Tests
+// =============================================================================
+
+TEST_CASE("gpu_table_representation with single column", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       100,
+                                       cudf::mask_state::UNALLOCATED,
+                                       ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+                                       gpu_space->get_default_allocator());
+  columns.push_back(std::move(col));
+
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  gpu_table_representation repr(
+    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  REQUIRE(repr.get_table_view().num_columns() == 1);
+  REQUIRE(repr.get_table_view().num_rows() == 100);
+  REQUIRE(repr.get_size_in_bytes() >= 100 * 4);  // At least 100 rows * 4 bytes
+}
+
+TEST_CASE("gpu_table_representation with multiple column types", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+
+  // INT8 column
+  auto col1 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT8}, 100, cudf::mask_state::UNALLOCATED);
+
+  // INT16 column
+  auto col2 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 100, cudf::mask_state::UNALLOCATED);
+
+  // INT32 column
+  auto col3 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 100, cudf::mask_state::UNALLOCATED);
+
+  // INT64 column
+  auto col4 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, 100, cudf::mask_state::UNALLOCATED);
+
+  columns.push_back(std::move(col1));
+  columns.push_back(std::move(col2));
+  columns.push_back(std::move(col3));
+  columns.push_back(std::move(col4));
+
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  gpu_table_representation repr(
+    std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  REQUIRE(repr.get_table_view().num_columns() == 4);
+  REQUIRE(repr.get_table_view().num_rows() == 100);
+  // Size should be at least 100 * (1 + 2 + 4 + 8) = 1500 bytes
+  REQUIRE(repr.get_size_in_bytes() >= 1500);
+}
+
+// Disabled: requires internal access to multiple_blocks_allocation constructor
+TEST_CASE("Representations polymorphism",
+          "[cpu_data_representation][gpu_data_representation][.disabled]")
+{
+  SUCCEED("Test disabled - requires internal API access");
+}
+
+// =============================================================================
+// Clone Tests
+// =============================================================================
+
+TEST_CASE("gpu_table_representation clone creates independent copy", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto table     = create_simple_cudf_table(100, gpu_space->get_default_allocator());
+
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  // Clone the representation
+  auto cloned_base = repr.clone(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  REQUIRE(cloned_base != nullptr);
+
+  // Verify it's a gpu_table_representation
+  auto* cloned = dynamic_cast<gpu_table_representation*>(cloned_base.get());
+  REQUIRE(cloned != nullptr);
+
+  // Verify the cloned representation has the same properties
+  REQUIRE(cloned->get_current_tier() == repr.get_current_tier());
+  REQUIRE(cloned->get_device_id() == repr.get_device_id());
+  REQUIRE(cloned->get_size_in_bytes() == repr.get_size_in_bytes());
+
+  // Verify the tables have the same shape
+  REQUIRE(cloned->get_table_view().num_columns() == repr.get_table_view().num_columns());
+  REQUIRE(cloned->get_table_view().num_rows() == repr.get_table_view().num_rows());
+
+  // Verify the data is equal
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table_view(),
+    cloned->get_table_view(),
+    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  // Verify the tables are independent (different memory addresses)
+  for (cudf::size_type i = 0; i < repr.get_table_view().num_columns(); ++i) {
+    REQUIRE(repr.get_table_view().column(i).head() != cloned->get_table_view().column(i).head());
+  }
+}
+
+TEST_CASE("gpu_table_representation clone empty table", "[gpu_data_representation]")
+{
+  auto gpu_space = make_mock_memory_space(memory::Tier::GPU, 0);
+  auto table     = create_simple_cudf_table(0, gpu_space->get_default_allocator());
+
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(table)),
+                                *gpu_space,
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto cloned_base = repr.clone(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  REQUIRE(cloned_base != nullptr);
+
+  auto* cloned = dynamic_cast<gpu_table_representation*>(cloned_base.get());
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_table_view().num_rows() == 0);
+  REQUIRE(cloned->get_size_in_bytes() == 0);
+}
+
+TEST_CASE("host_data_packed_representation clone creates independent copy",
+          "[cpu_data_representation]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+
+  // Create a host_data_packed_representation via conversion from GPU
+  // Use the same stream for table creation and conversion to avoid stream-ordered races
+  rmm::cuda_stream stream;
+  auto original = create_simple_cudf_table(128, 2, gpu_space->get_default_allocator(), stream);
+  gpu_table_representation gpu_repr(std::make_unique<cudf::table>(std::move(original)),
+                                    *const_cast<memory::memory_space*>(gpu_space),
+                                    ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto host_repr_ptr =
+    registry.convert<host_data_packed_representation>(gpu_repr, host_space, stream);
+  stream.synchronize();
+
+  // Clone the host representation
+  auto cloned_base = host_repr_ptr->clone(stream);
+  REQUIRE(cloned_base != nullptr);
+
+  auto* cloned = dynamic_cast<host_data_packed_representation*>(cloned_base.get());
+  REQUIRE(cloned != nullptr);
+
+  // Verify properties match
+  REQUIRE(cloned->get_current_tier() == host_repr_ptr->get_current_tier());
+  REQUIRE(cloned->get_device_id() == host_repr_ptr->get_device_id());
+  REQUIRE(cloned->get_size_in_bytes() == host_repr_ptr->get_size_in_bytes());
+
+  // Verify the underlying allocations are different (independent)
+  REQUIRE(cloned->get_host_table().get() != host_repr_ptr->get_host_table().get());
+  REQUIRE(cloned->get_host_table()->allocation.get() !=
+          host_repr_ptr->get_host_table()->allocation.get());
+
+  // Convert both back to GPU and verify data equality
+  auto cloned_gpu = registry.convert<gpu_table_representation>(*cloned, gpu_space, stream);
+  auto orig_gpu   = registry.convert<gpu_table_representation>(*host_repr_ptr, gpu_space, stream);
+  stream.synchronize();
+
+  cucascade::test::expect_cudf_tables_equal_on_stream(
+    orig_gpu->get_table_view(), cloned_gpu->get_table_view(), stream);
+}
+
+//  */
+
+// =============================================================================
+// host_data_representation Tests
+// =============================================================================
+
+/// Read `size` bytes from a multi-block allocation starting at byte offset `offset`.
+static std::vector<uint8_t> read_from_alloc(
+  const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
+  std::size_t offset,
+  std::size_t size)
+{
+  std::vector<uint8_t> result(size);
+  const std::size_t blk_sz = alloc.block_size();
+  std::size_t bi = offset / blk_sz, bo = offset % blk_sz, di = 0;
+  while (di < size) {
+    std::size_t n = std::min(size - di, blk_sz - bo);
+    std::memcpy(result.data() + di, alloc.at(bi).data() + bo, n);
+    di += n;
+    bo += n;
+    if (bo == blk_sz) {
+      ++bi;
+      bo = 0;
+    }
+  }
+  return result;
+}
+
+/// Synchronously copy `size` bytes from a GPU pointer to a host std::vector.
+static std::vector<uint8_t> gpu_bytes(const void* ptr, std::size_t size)
+{
+  std::vector<uint8_t> result(size);
+  if (size > 0 && ptr != nullptr) {
+    CUCASCADE_CUDA_TRY(cudaMemcpy(result.data(), ptr, size, cudaMemcpyDeviceToHost));
+  }
+  return result;
+}
+
+/// Wrap a single column into a gpu_table_representation.
+static gpu_table_representation wrap_column(std::unique_ptr<cudf::column> col,
+                                            memory::memory_space& gpu_space,
+                                            ::cuda::stream_ref writer_stream = ::cuda::stream_ref{
+                                              cudaStream_t{cudaStreamDefault}})
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return gpu_table_representation(
+    std::make_unique<cudf::table>(std::move(cols)), gpu_space, writer_stream);
+}
+
+/// Convert a gpu_table_representation to host_data_representation via the registry.
+static std::unique_ptr<host_data_representation> fast_convert(
+  gpu_table_representation& src,
+  const memory::memory_space* host_space,
+  representation_converter_registry& registry,
+  ::cuda::stream_ref stream)
+{
+  return registry.convert<host_data_representation>(src, host_space, stream);
+}
+
+// =============================================================================
+// Converter registration
+// =============================================================================
+
+TEST_CASE("register_builtin_converters registers GPU->host_data_representation",
+          "[fast][registration]")
+{
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  REQUIRE(registry.has_converter<gpu_table_representation, host_data_representation>());
+}
+
+// =============================================================================
+// Fixed-width primitive types — metadata correctness
+// =============================================================================
+
+template <cudf::type_id TypeID, typename CppType>
+static void check_fixed_width_metadata(memory::memory_reservation_manager& mgr,
+                                       representation_converter_registry& registry)
+{
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 100;
+  auto col        = cudf::make_numeric_column(cudf::data_type{TypeID},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(host != nullptr);
+  REQUIRE(host->get_current_tier() == memory::Tier::HOST);
+  REQUIRE(host->get_size_in_bytes() > 0);
+
+  const auto& cols = host->get_host_table()->columns;
+  REQUIRE(cols.size() == 1);
+  REQUIRE(cols[0].type_id == static_cast<int32_t>(TypeID));
+  REQUIRE(cols[0].num_rows == N);
+  REQUIRE(cols[0].has_data == true);
+  REQUIRE(cols[0].data_size == static_cast<std::size_t>(N) * sizeof(CppType));
+  REQUIRE(cols[0].has_null_mask == false);
+  REQUIRE(cols[0].children.empty());
+}
+
+TEST_CASE("Fast converter metadata: fixed-width primitive types", "[fast][metadata]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  // clang-format off
+  SECTION("INT8")   { check_fixed_width_metadata<cudf::type_id::INT8,   int8_t  >(mgr, registry); }
+  SECTION("INT16")  { check_fixed_width_metadata<cudf::type_id::INT16,  int16_t >(mgr, registry); }
+  SECTION("INT32")  { check_fixed_width_metadata<cudf::type_id::INT32,  int32_t >(mgr, registry); }
+  SECTION("INT64")  { check_fixed_width_metadata<cudf::type_id::INT64,  int64_t >(mgr, registry); }
+  SECTION("UINT8")  { check_fixed_width_metadata<cudf::type_id::UINT8,  uint8_t >(mgr, registry); }
+  SECTION("UINT16") { check_fixed_width_metadata<cudf::type_id::UINT16, uint16_t>(mgr, registry); }
+  SECTION("UINT32") { check_fixed_width_metadata<cudf::type_id::UINT32, uint32_t>(mgr, registry); }
+  SECTION("UINT64") { check_fixed_width_metadata<cudf::type_id::UINT64, uint64_t>(mgr, registry); }
+  SECTION("FLOAT32"){ check_fixed_width_metadata<cudf::type_id::FLOAT32, float  >(mgr, registry); }
+  SECTION("FLOAT64"){ check_fixed_width_metadata<cudf::type_id::FLOAT64, double >(mgr, registry); }
+  SECTION("BOOL8")  { check_fixed_width_metadata<cudf::type_id::BOOL8,   bool   >(mgr, registry); }
+  // clang-format on
+}
+
+// =============================================================================
+// Byte-level data integrity
+// =============================================================================
+
+TEST_CASE("Fast converter copies INT32 data bytes correctly", "[fast][data_integrity]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 200;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
+  const void* gpu_ptr = col->view().data<int32_t>();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  auto actual_bytes =
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+  auto expected_bytes = gpu_bytes(gpu_ptr, meta.data_size);
+  REQUIRE(actual_bytes == expected_bytes);
+}
+
+TEST_CASE("Fast converter copies FLOAT64 data bytes correctly", "[fast][data_integrity]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 150;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream.value()));
+  const void* gpu_ptr = col->view().data<double>();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  auto actual_bytes =
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+  auto expected_bytes = gpu_bytes(gpu_ptr, meta.data_size);
+  REQUIRE(actual_bytes == expected_bytes);
+}
+
+// =============================================================================
+// Nullable columns
+// =============================================================================
+
+TEST_CASE("Fast converter: nullable INT32 — null mask metadata and bytes", "[fast][nullable]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N      = 100;
+  auto col             = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::ALL_VALID,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  const void* mask_ptr = col->view().null_mask();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  REQUIRE(meta.has_null_mask == true);
+  REQUIRE(meta.null_mask_size == cudf::bitmask_allocation_size_bytes(N));
+
+  auto actual_mask = read_from_alloc(
+    *host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+  auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
+  REQUIRE(actual_mask == expected_mask);
+}
+
+TEST_CASE("Fast converter: nullable INT64 — both null mask and data bytes are correct",
+          "[fast][nullable]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 64;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                       N,
+                                       cudf::mask_state::ALL_VALID,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream.value()));
+  const void* data_ptr = col->view().data<int64_t>();
+  const void* mask_ptr = col->view().null_mask();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+
+  auto actual_data =
+    read_from_alloc(*host->get_host_table()->allocation, meta.data_offset, meta.data_size);
+  auto expected_data = gpu_bytes(data_ptr, meta.data_size);
+  REQUIRE(actual_data == expected_data);
+
+  auto actual_mask = read_from_alloc(
+    *host->get_host_table()->allocation, meta.null_mask_offset, meta.null_mask_size);
+  auto expected_mask = gpu_bytes(mask_ptr, meta.null_mask_size);
+  REQUIRE(actual_mask == expected_mask);
+}
+
+// =============================================================================
+// Timestamp and Duration columns
+// =============================================================================
+
+TEST_CASE("Fast converter: timestamp columns metadata", "[fast][timestamp]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+  constexpr int N = 50;
+
+  SECTION("TIMESTAMP_DAYS — stored as int32_t")
+  {
+    auto col = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                           N,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_DAYS));
+    REQUIRE(meta.has_data == true);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
+    REQUIRE(meta.children.empty());
+  }
+
+  SECTION("TIMESTAMP_SECONDS — stored as int64_t")
+  {
+    auto col = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS},
+                                           N,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_SECONDS));
+    REQUIRE(meta.has_data == true);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
+  }
+
+  SECTION("TIMESTAMP_MICROSECONDS — stored as int64_t")
+  {
+    auto col = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS},
+                                           N,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::TIMESTAMP_MICROSECONDS));
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
+  }
+}
+
+TEST_CASE("Fast converter: duration columns metadata", "[fast][duration]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+  constexpr int N = 50;
+
+  SECTION("DURATION_DAYS — stored as int32_t")
+  {
+    auto col = cudf::make_duration_column(cudf::data_type{cudf::type_id::DURATION_DAYS},
+                                          N,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_DAYS));
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
+  }
+
+  SECTION("DURATION_MILLISECONDS — stored as int64_t")
+  {
+    auto col = cudf::make_duration_column(cudf::data_type{cudf::type_id::DURATION_MILLISECONDS},
+                                          N,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_MILLISECONDS));
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
+  }
+
+  SECTION("DURATION_NANOSECONDS — stored as int64_t")
+  {
+    auto col = cudf::make_duration_column(cudf::data_type{cudf::type_id::DURATION_NANOSECONDS},
+                                          N,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DURATION_NANOSECONDS));
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
+  }
+}
+
+// =============================================================================
+// Decimal columns — scale stored in metadata
+// =============================================================================
+
+TEST_CASE("Fast converter: decimal columns store scale in metadata", "[fast][decimal]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+  constexpr int N = 50;
+
+  SECTION("DECIMAL32 scale=-3, element size=4")
+  {
+    auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL32, -3},
+                                             N,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL32));
+    REQUIRE(meta.scale == -3);
+    REQUIRE(meta.has_data == true);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
+    REQUIRE(meta.children.empty());
+  }
+
+  SECTION("DECIMAL64 scale=-6, element size=8")
+  {
+    auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, -6},
+                                             N,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL64));
+    REQUIRE(meta.scale == -6);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sizeof(int64_t));
+  }
+
+  SECTION("DECIMAL128 scale=-9, element size=16")
+  {
+    auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL128, -9},
+                                             N,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             gpu_space->get_default_allocator());
+    stream.synchronize();
+    auto repr = wrap_column(std::move(col),
+                            *const_cast<memory::memory_space*>(gpu_space),
+                            ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+    auto host = fast_convert(repr, host_space, registry, stream);
+    stream.synchronize();
+    const auto& meta = host->get_host_table()->columns[0];
+    REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::DECIMAL128));
+    REQUIRE(meta.scale == -9);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * 16);  // 128-bit = 16 bytes
+  }
+}
+
+// =============================================================================
+// STRING column — children metadata: offsets + chars
+// =============================================================================
+
+TEST_CASE("Fast converter: STRING column metadata structure", "[fast][string]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  // Build a strings column with 4 strings and 10 total characters
+  // offsets: [0, 2, 5, 7, 10]  — child[0]: INT32, 5 elements
+  // chars:   10 bytes of 'x'   — child[1]: INT8, 10 elements
+  constexpr int num_strings = 4;
+  constexpr int total_chars = 10;
+
+  std::vector<int32_t> host_offsets = {0, 2, 5, 7, 10};
+  rmm::device_buffer offsets_buf(host_offsets.data(),
+                                 host_offsets.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(host_offsets.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+
+  std::vector<int8_t> host_chars(total_chars, 'x');
+  rmm::device_buffer chars_buf(
+    host_chars.data(), host_chars.size(), stream, gpu_space->get_default_allocator());
+
+  stream.synchronize();
+
+  auto strings_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(strings_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::STRING));
+  REQUIRE(meta.num_rows == num_strings);
+  // In this cudf version, STRING stores chars in the column's data buffer.
+  REQUIRE(meta.has_data == true);
+  REQUIRE(meta.data_size == static_cast<std::size_t>(total_chars));
+  REQUIRE(meta.has_null_mask == false);
+  // Single child: offsets (INT32)
+  REQUIRE(meta.children.size() == 1);
+
+  const auto& offsets_meta = meta.children[0];
+  REQUIRE(offsets_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(offsets_meta.num_rows == num_strings + 1);
+  REQUIRE(offsets_meta.has_data == true);
+  REQUIRE(offsets_meta.data_size == static_cast<std::size_t>(num_strings + 1) * sizeof(int32_t));
+}
+
+// =============================================================================
+// LIST column — children metadata: offsets + values
+// =============================================================================
+
+TEST_CASE("Fast converter: LIST<INT32> column metadata structure", "[fast][list]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  // 3 lists with 7 total elements: [0..1], [2..4], [5..6]
+  constexpr int num_lists  = 3;
+  constexpr int num_values = 7;
+
+  std::vector<int32_t> host_offsets = {0, 2, 5, 7};
+  rmm::device_buffer offsets_buf(host_offsets.data(),
+                                 host_offsets.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(host_offsets.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+
+  auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                              num_values,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(list_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(meta.num_rows == num_lists);
+  REQUIRE(meta.has_data == false);
+  REQUIRE(meta.has_null_mask == false);
+  REQUIRE(meta.children.size() == 2);
+
+  const auto& offsets_meta = meta.children[0];
+  REQUIRE(offsets_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(offsets_meta.num_rows == num_lists + 1);
+  REQUIRE(offsets_meta.has_data == true);
+  REQUIRE(offsets_meta.data_size == static_cast<std::size_t>(num_lists + 1) * sizeof(int32_t));
+
+  const auto& values_meta = meta.children[1];
+  REQUIRE(values_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(values_meta.num_rows == num_values);
+  REQUIRE(values_meta.has_data == true);
+  REQUIRE(values_meta.data_size == static_cast<std::size_t>(num_values) * sizeof(int32_t));
+}
+
+TEST_CASE("Fast converter: nullable LIST<INT32> preserves parent null mask", "[fast][list]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int num_lists  = 3;
+  constexpr int num_values = 5;
+
+  std::vector<int32_t> host_offsets = {0, 2, 3, 5};
+  rmm::device_buffer offsets_buf(host_offsets.data(),
+                                 host_offsets.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(host_offsets.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+
+  auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                              num_values,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              gpu_space->get_default_allocator());
+
+  // Build a null mask marking the first list as null (bit 0 = 0)
+  auto null_mask = cudf::create_null_mask(num_lists, cudf::mask_state::ALL_VALID, stream);
+  stream.synchronize();
+
+  auto list_col = cudf::make_lists_column(
+    num_lists, std::move(offsets_col), std::move(values_col), 1, std::move(null_mask));
+
+  auto repr = wrap_column(std::move(list_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(meta.has_null_mask == true);
+  REQUIRE(meta.null_mask_size == cudf::bitmask_allocation_size_bytes(num_lists));
+}
+
+// =============================================================================
+// STRUCT column — field children metadata
+// =============================================================================
+
+TEST_CASE("Fast converter: STRUCT<INT32, FLOAT64> column metadata structure", "[fast][struct]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 8;
+  auto field0     = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          N,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+  auto field1     = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                          N,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(std::move(field0));
+  children.push_back(std::move(field1));
+  auto struct_col = cudf::make_structs_column(
+    N, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(struct_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  const auto& meta = host->get_host_table()->columns[0];
+  REQUIRE(meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
+  REQUIRE(meta.num_rows == N);
+  REQUIRE(meta.has_data == false);
+  REQUIRE(meta.has_null_mask == false);
+  REQUIRE(meta.children.size() == 2);
+
+  REQUIRE(meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(meta.children[0].num_rows == N);
+  REQUIRE(meta.children[0].has_data == true);
+  REQUIRE(meta.children[0].data_size == static_cast<std::size_t>(N) * sizeof(int32_t));
+
+  REQUIRE(meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
+  REQUIRE(meta.children[1].num_rows == N);
+  REQUIRE(meta.children[1].has_data == true);
+  REQUIRE(meta.children[1].data_size == static_cast<std::size_t>(N) * sizeof(double));
+}
+
+// =============================================================================
+// Nested types: LIST<LIST<INT32>>
+// =============================================================================
+
+TEST_CASE("Fast converter: LIST<LIST<INT32>> nested metadata", "[fast][nested]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  // Outer list: 2 lists of inner lists
+  // Inner lists: 3 inner lists with [2, 3, 2] elements = 7 total values
+  // outer_offsets: [0, 2, 3]    — 2 outer lists
+  // inner_offsets: [0, 2, 5, 7] — 3 inner lists
+  // values: 7 INT32 elements
+  constexpr int num_outer  = 2;
+  constexpr int num_inner  = 3;
+  constexpr int num_values = 7;
+
+  auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          num_values,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space->get_default_allocator());
+
+  std::vector<int32_t> inner_offs_h = {0, 2, 5, 7};
+  rmm::device_buffer inner_offs_buf(inner_offs_h.data(),
+                                    inner_offs_h.size() * sizeof(int32_t),
+                                    stream,
+                                    gpu_space->get_default_allocator());
+  auto inner_offsets =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(inner_offs_h.size()),
+                                   std::move(inner_offs_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+  stream.synchronize();
+
+  auto inner_list =
+    cudf::make_lists_column(num_inner,
+                            std::move(inner_offsets),
+                            std::move(values),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  std::vector<int32_t> outer_offs_h = {0, 2, 3};
+  rmm::device_buffer outer_offs_buf(outer_offs_h.data(),
+                                    outer_offs_h.size() * sizeof(int32_t),
+                                    stream,
+                                    gpu_space->get_default_allocator());
+  auto outer_offsets =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(outer_offs_h.size()),
+                                   std::move(outer_offs_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+  stream.synchronize();
+
+  auto outer_list =
+    cudf::make_lists_column(num_outer,
+                            std::move(outer_offsets),
+                            std::move(inner_list),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(outer_list),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  // Outer LIST
+  const auto& outer_meta = host->get_host_table()->columns[0];
+  REQUIRE(outer_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(outer_meta.num_rows == num_outer);
+  REQUIRE(outer_meta.has_data == false);
+  REQUIRE(outer_meta.children.size() == 2);
+
+  // outer.children[0] = outer offsets (INT32)
+  REQUIRE(outer_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(outer_meta.children[0].num_rows == num_outer + 1);
+  REQUIRE(outer_meta.children[0].has_data == true);
+
+  // outer.children[1] = inner LIST
+  const auto& inner_meta = outer_meta.children[1];
+  REQUIRE(inner_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(inner_meta.num_rows == num_inner);
+  REQUIRE(inner_meta.has_data == false);
+  REQUIRE(inner_meta.children.size() == 2);
+
+  // inner.children[0] = inner offsets (INT32)
+  REQUIRE(inner_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(inner_meta.children[0].num_rows == num_inner + 1);
+
+  // inner.children[1] = values (INT32)
+  REQUIRE(inner_meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(inner_meta.children[1].num_rows == num_values);
+  REQUIRE(inner_meta.children[1].has_data == true);
+  REQUIRE(inner_meta.children[1].data_size ==
+          static_cast<std::size_t>(num_values) * sizeof(int32_t));
+}
+
+// =============================================================================
+// Nested types: LIST<STRUCT<INT32, FLOAT64>>
+// =============================================================================
+
+TEST_CASE("Fast converter: LIST<STRUCT<INT32,FLOAT64>> nested metadata", "[fast][nested]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  // 3 lists with 5 total struct elements
+  // offsets: [0, 2, 2, 5]  — list[0]={s0,s1}, list[1]={} (empty), list[2]={s2,s3,s4}
+  constexpr int num_lists   = 3;
+  constexpr int num_structs = 5;
+
+  // Build the STRUCT<INT32, FLOAT64> child column (num_structs elements)
+  auto f0 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                      num_structs,
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      gpu_space->get_default_allocator());
+  auto f1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                      num_structs,
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> struct_fields;
+  struct_fields.push_back(std::move(f0));
+  struct_fields.push_back(std::move(f1));
+  auto struct_col =
+    cudf::make_structs_column(num_structs,
+                              std::move(struct_fields),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  // Build the offsets column for the LIST
+  std::vector<int32_t> offsets_h = {0, 2, 2, 5};
+  rmm::device_buffer offsets_buf(offsets_h.data(),
+                                 offsets_h.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(offsets_h.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+  stream.synchronize();
+
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(struct_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(list_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  // Outer: LIST
+  const auto& list_meta = host->get_host_table()->columns[0];
+  REQUIRE(list_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(list_meta.num_rows == num_lists);
+  REQUIRE(list_meta.has_data == false);
+  REQUIRE(list_meta.children.size() == 2);
+
+  // list.children[0] = offsets (INT32)
+  const auto& offs_meta = list_meta.children[0];
+  REQUIRE(offs_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(offs_meta.num_rows == num_lists + 1);
+  REQUIRE(offs_meta.has_data == true);
+  REQUIRE(offs_meta.data_size == static_cast<std::size_t>(num_lists + 1) * sizeof(int32_t));
+
+  // list.children[1] = STRUCT<INT32, FLOAT64>
+  const auto& struct_meta = list_meta.children[1];
+  REQUIRE(struct_meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
+  REQUIRE(struct_meta.num_rows == num_structs);
+  REQUIRE(struct_meta.has_data == false);
+  REQUIRE(struct_meta.children.size() == 2);
+
+  REQUIRE(struct_meta.children[0].type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(struct_meta.children[0].num_rows == num_structs);
+  REQUIRE(struct_meta.children[0].has_data == true);
+  REQUIRE(struct_meta.children[0].data_size ==
+          static_cast<std::size_t>(num_structs) * sizeof(int32_t));
+
+  REQUIRE(struct_meta.children[1].type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
+  REQUIRE(struct_meta.children[1].num_rows == num_structs);
+  REQUIRE(struct_meta.children[1].has_data == true);
+  REQUIRE(struct_meta.children[1].data_size ==
+          static_cast<std::size_t>(num_structs) * sizeof(double));
+}
+
+// =============================================================================
+// Nested types: STRUCT<LIST<INT32>, FLOAT64>
+// =============================================================================
+
+TEST_CASE("Fast converter: STRUCT<LIST<INT32>,FLOAT64> nested metadata", "[fast][nested]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  // STRUCT with 4 rows, where:
+  //   field[0] = LIST<INT32>: 4 lists with 9 total INT32 values
+  //              offsets: [0, 3, 3, 7, 9]
+  //   field[1] = FLOAT64: 4 scalar values
+  constexpr int num_rows   = 4;
+  constexpr int num_values = 9;
+
+  // Build LIST<INT32> field
+  std::vector<int32_t> offs_h = {0, 3, 3, 7, 9};
+  rmm::device_buffer offs_buf(
+    offs_h.data(), offs_h.size() * sizeof(int32_t), stream, gpu_space->get_default_allocator());
+  auto offs_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(offs_h.size()),
+                                   std::move(offs_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+
+  auto vals_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            num_values,
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto list_field =
+    cudf::make_lists_column(num_rows,
+                            std::move(offs_col),
+                            std::move(vals_col),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  // Build FLOAT64 field
+  auto float_field = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                               num_rows,
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  // Build STRUCT<LIST<INT32>, FLOAT64>
+  std::vector<std::unique_ptr<cudf::column>> fields;
+  fields.push_back(std::move(list_field));
+  fields.push_back(std::move(float_field));
+  auto struct_col = cudf::make_structs_column(
+    num_rows, std::move(fields), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto repr = wrap_column(std::move(struct_col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  // Top-level: STRUCT
+  const auto& struct_meta = host->get_host_table()->columns[0];
+  REQUIRE(struct_meta.type_id == static_cast<int32_t>(cudf::type_id::STRUCT));
+  REQUIRE(struct_meta.num_rows == num_rows);
+  REQUIRE(struct_meta.has_data == false);
+  REQUIRE(struct_meta.children.size() == 2);
+
+  // struct.children[0] = LIST<INT32>
+  const auto& list_meta = struct_meta.children[0];
+  REQUIRE(list_meta.type_id == static_cast<int32_t>(cudf::type_id::LIST));
+  REQUIRE(list_meta.num_rows == num_rows);
+  REQUIRE(list_meta.has_data == false);
+  REQUIRE(list_meta.children.size() == 2);
+
+  // list offsets
+  const auto& list_offs_meta = list_meta.children[0];
+  REQUIRE(list_offs_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(list_offs_meta.num_rows == num_rows + 1);
+  REQUIRE(list_offs_meta.has_data == true);
+  REQUIRE(list_offs_meta.data_size == static_cast<std::size_t>(num_rows + 1) * sizeof(int32_t));
+
+  // list values
+  const auto& list_vals_meta = list_meta.children[1];
+  REQUIRE(list_vals_meta.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(list_vals_meta.num_rows == num_values);
+  REQUIRE(list_vals_meta.has_data == true);
+  REQUIRE(list_vals_meta.data_size == static_cast<std::size_t>(num_values) * sizeof(int32_t));
+
+  // struct.children[1] = FLOAT64
+  const auto& float_meta = struct_meta.children[1];
+  REQUIRE(float_meta.type_id == static_cast<int32_t>(cudf::type_id::FLOAT64));
+  REQUIRE(float_meta.num_rows == num_rows);
+  REQUIRE(float_meta.has_data == true);
+  REQUIRE(float_meta.data_size == static_cast<std::size_t>(num_rows) * sizeof(double));
+}
+
+// =============================================================================
+// Empty table (0 rows)
+// =============================================================================
+
+TEST_CASE("Fast converter: empty table (0 rows)", "[fast][empty]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                        0,
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        gpu_space->get_default_allocator());
+  auto col2 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                        0,
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col1));
+  cols.push_back(std::move(col2));
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(cols)),
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(host != nullptr);
+  REQUIRE(host->get_size_in_bytes() == 0);
+  REQUIRE(host->get_host_table()->columns.size() == 2);
+
+  for (const auto& meta : host->get_host_table()->columns) {
+    REQUIRE(meta.num_rows == 0);
+    REQUIRE(meta.has_data == false);  // size 0 → no data to copy
+    REQUIRE(meta.has_null_mask == false);
+  }
+}
+
+// =============================================================================
+// Multi-column table spanning all primitive types
+// =============================================================================
+
+TEST_CASE("Fast converter: multi-column table with all primitive types", "[fast][multi_column]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 16;
+
+  using TypePair                         = std::pair<cudf::type_id, std::size_t>;
+  const std::vector<TypePair> type_sizes = {
+    {cudf::type_id::INT8, sizeof(int8_t)},
+    {cudf::type_id::INT16, sizeof(int16_t)},
+    {cudf::type_id::INT32, sizeof(int32_t)},
+    {cudf::type_id::INT64, sizeof(int64_t)},
+    {cudf::type_id::UINT8, sizeof(uint8_t)},
+    {cudf::type_id::UINT16, sizeof(uint16_t)},
+    {cudf::type_id::UINT32, sizeof(uint32_t)},
+    {cudf::type_id::UINT64, sizeof(uint64_t)},
+    {cudf::type_id::FLOAT32, sizeof(float)},
+    {cudf::type_id::FLOAT64, sizeof(double)},
+    {cudf::type_id::BOOL8, sizeof(bool)},
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  for (const auto& [tid, sz] : type_sizes) {
+    cols.push_back(cudf::make_numeric_column(cudf::data_type{tid},
+                                             N,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             gpu_space->get_default_allocator()));
+  }
+  stream.synchronize();
+
+  gpu_table_representation repr(std::make_unique<cudf::table>(std::move(cols)),
+                                *const_cast<memory::memory_space*>(gpu_space),
+                                ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(host != nullptr);
+  REQUIRE(host->get_host_table()->columns.size() == type_sizes.size());
+
+  for (std::size_t i = 0; i < type_sizes.size(); ++i) {
+    const auto& [tid, sz] = type_sizes[i];
+    const auto& meta      = host->get_host_table()->columns[i];
+    REQUIRE(meta.type_id == static_cast<int32_t>(tid));
+    REQUIRE(meta.num_rows == N);
+    REQUIRE(meta.has_data == true);
+    REQUIRE(meta.data_size == static_cast<std::size_t>(N) * sz);
+    REQUIRE(meta.has_null_mask == false);
+    REQUIRE(meta.children.empty());
+  }
+}
+
+// =============================================================================
+// clone() creates an independent copy with identical byte content
+// =============================================================================
+
+TEST_CASE("host_data_representation clone: same bytes, independent allocation", "[fast][clone]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 100;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int32_t), stream.value()));
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto cloned_base = host->clone(stream);
+  REQUIRE(cloned_base != nullptr);
+
+  auto* cloned = dynamic_cast<host_data_representation*>(cloned_base.get());
+  REQUIRE(cloned != nullptr);
+
+  // Same logical properties
+  REQUIRE(cloned->get_size_in_bytes() == host->get_size_in_bytes());
+  REQUIRE(cloned->get_current_tier() == host->get_current_tier());
+
+  // Different underlying allocations (fully independent)
+  REQUIRE(cloned->get_host_table().get() != host->get_host_table().get());
+  REQUIRE(cloned->get_host_table()->allocation.get() != host->get_host_table()->allocation.get());
+
+  // Metadata structure is mirrored
+  REQUIRE(cloned->get_host_table()->columns.size() == host->get_host_table()->columns.size());
+  REQUIRE(cloned->get_host_table()->columns[0].type_id ==
+          host->get_host_table()->columns[0].type_id);
+  REQUIRE(cloned->get_host_table()->columns[0].data_size ==
+          host->get_host_table()->columns[0].data_size);
+
+  // Byte content is identical
+  const auto& orig_meta  = host->get_host_table()->columns[0];
+  const auto& clone_meta = cloned->get_host_table()->columns[0];
+  auto orig_bytes        = read_from_alloc(
+    *host->get_host_table()->allocation, orig_meta.data_offset, orig_meta.data_size);
+  auto clone_bytes = read_from_alloc(
+    *cloned->get_host_table()->allocation, clone_meta.data_offset, clone_meta.data_size);
+  REQUIRE(orig_bytes == clone_bytes);
+  REQUIRE(orig_bytes[0] == 0x55);  // Known fill pattern
+}
+
+TEST_CASE("host_data_representation clone: empty table", "[fast][clone]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       0,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto repr = wrap_column(std::move(col),
+                          *const_cast<memory::memory_space*>(gpu_space),
+                          ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host = fast_convert(repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto cloned_base = host->clone(stream);
+  auto* cloned     = dynamic_cast<host_data_representation*>(cloned_base.get());
+  REQUIRE(cloned != nullptr);
+  REQUIRE(cloned->get_size_in_bytes() == 0);
+  REQUIRE(cloned->get_host_table()->columns.size() == 1);
+  REQUIRE(cloned->get_host_table()->columns[0].num_rows == 0);
+}
+
+// =============================================================================
+// Round-trip: HOST FAST → GPU
+// =============================================================================
+
+/// Convert a host_data_representation back to gpu_table_representation via registry.
+static std::unique_ptr<gpu_table_representation> fast_back_convert(
+  host_data_representation& src,
+  const memory::memory_space* gpu_space,
+  representation_converter_registry& registry,
+  ::cuda::stream_ref stream)
+{
+  return registry.convert<gpu_table_representation>(src, gpu_space, stream);
+}
+
+TEST_CASE("register_builtin_converters registers host_data_representation->GPU",
+          "[fast][registration]")
+{
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+  REQUIRE(registry.has_converter<host_data_representation, gpu_table_representation>());
+}
+
+TEST_CASE("Round-trip fast: INT32 column data preserved", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 64;
+  auto col        = cudf::make_numeric_column(cudf::data_type(cudf::type_id::INT32),
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xAB, N * sizeof(int32_t), stream.value()));
+
+  auto orig_repr = wrap_column(std::move(col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back != nullptr);
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == N);
+
+  cudf::table_view back_tv = back->get_table_view();
+  auto bytes               = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int32_t));
+  REQUIRE(bytes[0] == 0xAB);
+  REQUIRE(bytes[N * sizeof(int32_t) - 1] == 0xAB);
+}
+
+TEST_CASE("Round-trip fast: all-valid null mask is elided on reconstruction", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 32;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                       N,
+                                       cudf::mask_state::ALL_VALID,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0x77, N * sizeof(int64_t), stream.value()));
+  stream.synchronize();
+
+  auto orig_repr = wrap_column(std::move(col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  cudf::table_view back_tv = back->get_table_view();
+  // An all-valid mask (null_count == 0) is semantically identical to no mask:
+  // reconstruction deliberately skips its upload and builds the column
+  // non-nullable, saving a per-column blocking memcpy + stream sync.
+  REQUIRE_FALSE(back_tv.column(0).nullable());
+  REQUIRE(back_tv.column(0).null_count() == 0);
+
+  auto data_bytes = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int64_t));
+  REQUIRE(data_bytes[0] == 0x77);
+}
+
+TEST_CASE("Round-trip fast: null mask with real nulls is uploaded and preserved",
+          "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 32;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                       N,
+                                       cudf::mask_state::ALL_VALID,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0x55, N * sizeof(int64_t), stream.value()));
+  // Null out rows [3, 7) — 4 nulls.
+  cudf::set_null_mask(col->mutable_view().null_mask(), 3, 7, false, stream);
+  stream.synchronize();
+  col->set_null_count(4);
+
+  auto orig_repr = wrap_column(std::move(col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  cudf::table_view back_tv = back->get_table_view();
+  REQUIRE(back_tv.column(0).nullable());
+  REQUIRE(back_tv.column(0).null_count() == 4);
+
+  // Mask bits round-trip exactly: rows [3, 7) invalid, everything else valid.
+  auto mask_bytes = gpu_bytes(reinterpret_cast<const uint8_t*>(back_tv.column(0).null_mask()),
+                              sizeof(cudf::bitmask_type));
+  const uint32_t mask_word =
+    static_cast<uint32_t>(mask_bytes[0]) | (static_cast<uint32_t>(mask_bytes[1]) << 8) |
+    (static_cast<uint32_t>(mask_bytes[2]) << 16) | (static_cast<uint32_t>(mask_bytes[3]) << 24);
+  REQUIRE(mask_word == ~(uint32_t{0b1111} << 3));
+
+  auto data_bytes = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(int64_t));
+  REQUIRE(data_bytes[0] == 0x55);
+  REQUIRE(data_bytes[N * sizeof(int64_t) - 1] == 0x55);
+}
+
+TEST_CASE("Round-trip fast: FLOAT64 byte integrity", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 50;
+  auto col        = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                       N,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(col->mutable_view().head(), 0xCD, N * sizeof(double), stream.value()));
+
+  auto orig_repr = wrap_column(std::move(col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  cudf::table_view back_tv = back->get_table_view();
+  auto data_bytes          = gpu_bytes(back_tv.column(0).data<uint8_t>(), N * sizeof(double));
+  REQUIRE(data_bytes[0] == 0xCD);
+  REQUIRE(data_bytes[N * sizeof(double) - 1] == 0xCD);
+}
+
+TEST_CASE("Round-trip fast: STRING column content preserved", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int num_strings = 4;
+  constexpr int total_chars = 10;
+
+  std::vector<int32_t> host_offsets = {0, 2, 5, 7, 10};
+  rmm::device_buffer offsets_buf(host_offsets.data(),
+                                 host_offsets.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(host_offsets.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+
+  std::vector<int8_t> host_chars(total_chars, 'x');
+  rmm::device_buffer chars_buf(
+    host_chars.data(), host_chars.size(), stream, gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto strings_col =
+    cudf::make_strings_column(num_strings,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto orig_repr = wrap_column(std::move(strings_col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == num_strings);
+  cudf::table_view back_tv = back->get_table_view();
+  REQUIRE(back_tv.column(0).type().id() == cudf::type_id::STRING);
+  // Chars should be preserved
+  auto char_bytes =
+    gpu_bytes(back_tv.column(0).data<uint8_t>(), static_cast<std::size_t>(total_chars));
+  REQUIRE(char_bytes[0] == static_cast<uint8_t>('x'));
+  REQUIRE(char_bytes[total_chars - 1] == static_cast<uint8_t>('x'));
+}
+
+TEST_CASE("Round-trip fast: LIST<INT32> structure preserved", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int num_lists  = 3;
+  constexpr int num_values = 7;
+
+  std::vector<int32_t> host_offsets = {0, 2, 5, 7};
+  rmm::device_buffer offsets_buf(host_offsets.data(),
+                                 host_offsets.size() * sizeof(int32_t),
+                                 stream,
+                                 gpu_space->get_default_allocator());
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(host_offsets.size()),
+                                   std::move(offsets_buf),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
+  auto values_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                              num_values,
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(cudaMemsetAsync(
+    values_col->mutable_view().head(), 0x33, num_values * sizeof(int32_t), stream.value()));
+  stream.synchronize();
+
+  auto list_col = cudf::make_lists_column(num_lists,
+                                          std::move(offsets_col),
+                                          std::move(values_col),
+                                          0,
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto orig_repr = wrap_column(std::move(list_col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_rows() == num_lists);
+  cudf::table_view back_tv = back->get_table_view();
+  REQUIRE(back_tv.column(0).type().id() == cudf::type_id::LIST);
+  REQUIRE(back_tv.column(0).num_children() == 2);
+  // Values child bytes preserved
+  auto val_bytes =
+    gpu_bytes(back_tv.column(0).child(1).data<uint8_t>(), num_values * sizeof(int32_t));
+  REQUIRE(val_bytes[0] == 0x33);
+}
+
+TEST_CASE("Round-trip fast: STRUCT<INT32,FLOAT64> fields preserved", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 8;
+  auto f0         = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                      N,
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      gpu_space->get_default_allocator());
+  auto f1         = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                      N,
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      gpu_space->get_default_allocator());
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(f0->mutable_view().head(), 0x11, N * sizeof(int32_t), stream.value()));
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(f1->mutable_view().head(), 0x22, N * sizeof(double), stream.value()));
+  stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> fields;
+  fields.push_back(std::move(f0));
+  fields.push_back(std::move(f1));
+  auto struct_col = cudf::make_structs_column(
+    N, std::move(fields), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+
+  auto orig_repr = wrap_column(std::move(struct_col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back->get_table_view().num_rows() == N);
+  cudf::table_view back_tv = back->get_table_view();
+  REQUIRE(back_tv.column(0).type().id() == cudf::type_id::STRUCT);
+  REQUIRE(back_tv.column(0).num_children() == 2);
+
+  auto f0_bytes = gpu_bytes(back_tv.column(0).child(0).data<uint8_t>(), N * sizeof(int32_t));
+  REQUIRE(f0_bytes[0] == 0x11);
+  auto f1_bytes = gpu_bytes(back_tv.column(0).child(1).data<uint8_t>(), N * sizeof(double));
+  REQUIRE(f1_bytes[0] == 0x22);
+}
+
+TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       0,
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto orig_repr = wrap_column(std::move(col),
+                               *const_cast<memory::memory_space*>(gpu_space),
+                               ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto host      = fast_convert(orig_repr, host_space, registry, stream);
+  stream.synchronize();
+
+  auto back = fast_back_convert(*host, gpu_space, registry, stream);
+  stream.synchronize();
+
+  REQUIRE(back != nullptr);
+  REQUIRE(back->get_table_view().num_columns() == 1);
+  REQUIRE(back->get_table_view().num_rows() == 0);
+  REQUIRE(back->get_table_view().column(0).type().id() == cudf::type_id::INT32);
+}
+
+// =============================================================================
+// host_data_representation::slice round-trip
+// =============================================================================
+
+namespace {
+
+/// Build a GPU table with four primitive columns, each filled with a distinct byte pattern so a
+/// mis-routed slice (wrong column or wrong bytes) is detectable byte-for-byte.
+std::unique_ptr<cudf::table> build_four_column_gpu_table(::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr,
+                                                         int num_rows)
+{
+  auto fill = [&](cudf::data_type dt, std::size_t bytes_per_row, uint8_t pattern) {
+    auto col = cudf::make_numeric_column(dt, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+    if (num_rows > 0) {
+      auto bytes = static_cast<std::size_t>(num_rows) * bytes_per_row;
+      CUCASCADE_CUDA_TRY(cudaMemsetAsync(col->mutable_view().head(), pattern, bytes, stream.get()));
+    }
+    return col;
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(fill(cudf::data_type{cudf::type_id::INT32}, sizeof(int32_t), 0xA1));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::INT64}, sizeof(int64_t), 0xB2));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::FLOAT32}, sizeof(float), 0xC3));
+  cols.push_back(fill(cudf::data_type{cudf::type_id::FLOAT64}, sizeof(double), 0xD4));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+}  // namespace
+
+TEST_CASE("host_data_representation::slice round-trip preserves selected columns",
+          "[fast][slice][roundtrip]")
+{
+  memory::memory_reservation_manager mgr(create_conversion_test_configs());
+  representation_converter_registry registry;
+  register_builtin_converters(registry);
+
+  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  rmm::cuda_stream stream;
+
+  constexpr int N = 128;
+  auto orig_table = build_four_column_gpu_table(stream, gpu_space->get_default_allocator(), N);
+  stream.synchronize();
+  const cudf::table_view orig_view = orig_table->view();
+
+  // GPU -> HOST
+  gpu_table_representation gpu_repr(
+    std::move(orig_table), *const_cast<memory::memory_space*>(gpu_space), stream);
+  auto host = fast_convert(gpu_repr, host_space, registry, stream);
+  stream.synchronize();
+  REQUIRE(host->num_columns() == 4);
+
+  SECTION("Slice keeps non-contiguous subset and matches original columns")
+  {
+    const std::array<std::size_t, 2> kept{0, 2};
+    auto sliced = host->slice(std::span<const std::size_t>(kept.data(), kept.size()));
+    REQUIRE(sliced != nullptr);
+    REQUIRE(sliced->num_columns() == 2);
+    REQUIRE(sliced->column_size(0) == host->column_size(0));
+    REQUIRE(sliced->column_size(1) == host->column_size(2));
+    // Slice shares buffers with the source allocation.
+    REQUIRE(sliced->get_host_table()->allocation.get() == host->get_host_table()->allocation.get());
+
+    auto back = fast_back_convert(*sliced, gpu_space, registry, stream);
+    stream.synchronize();
+    REQUIRE(back != nullptr);
+    REQUIRE(back->get_table_view().num_columns() == 2);
+
+    const cudf::table_view expected_view{{orig_view.column(kept[0]), orig_view.column(kept[1])}};
+    cucascade::test::expect_cudf_tables_equal_on_stream(
+      expected_view, back->get_table_view(), stream);
+  }
+
+  SECTION("Reordered slice maps to the requested column order")
+  {
+    const std::array<std::size_t, 3> kept{3, 1, 0};
+    auto sliced = host->slice(std::span<const std::size_t>(kept.data(), kept.size()));
+    REQUIRE(sliced->num_columns() == 3);
+
+    auto back = fast_back_convert(*sliced, gpu_space, registry, stream);
+    stream.synchronize();
+    REQUIRE(back->get_table_view().num_columns() == 3);
+
+    const cudf::table_view expected_view{
+      {orig_view.column(kept[0]), orig_view.column(kept[1]), orig_view.column(kept[2])}};
+    cucascade::test::expect_cudf_tables_equal_on_stream(
+      expected_view, back->get_table_view(), stream);
+  }
+
+  SECTION("Out-of-range index throws")
+  {
+    const std::array<std::size_t, 1> kept{4};  // valid range is [0, 4)
+    REQUIRE_THROWS_AS(host->slice(std::span<const std::size_t>(kept.data(), kept.size())),
+                      std::out_of_range);
+  }
+}

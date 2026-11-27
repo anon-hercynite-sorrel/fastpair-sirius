@@ -1,0 +1,90 @@
+{
+    "io": {
+        "total_bytes_read": 22309359,
+        "total_bytes_written": 0
+    },
+    "operator": [
+        {
+            "extra_info": {},
+            "intermediate_rows": 0,
+            "intermediate_size_bytes": 0,
+            "timing": 0.0000294,
+            "type": "RESULT_COLLECTOR",
+            "children": [
+                {
+                    "extra_info": {},
+                    "intermediate_rows": 1,
+                    "intermediate_size_bytes": 8,
+                    "timing": 0.039897451,
+                    "type": "EXTENSION"
+                }
+            ]
+        }
+    ],
+    "optimizer": {
+        "aggregate_function_rewriter": 0.0000056,
+        "build_side_probe_side": 0.00000176,
+        "column_lifetime": 0.00000218,
+        "common_aggregate": 9.3e-7,
+        "common_subexpressions": 0.00000164,
+        "common_subplan": 0.00000997,
+        "cte_filter_pusher": 0.00000103,
+        "cte_inlining": 6.5e-7,
+        "deliminator": 6.2e-7,
+        "duplicate_groups": 0.00000175,
+        "empty_result_pullup": 7.4e-7,
+        "expression_rewriter": 0.00003299,
+        "extension": 0.05619817,
+        "filter_pullup": 0.00000133,
+        "filter_pushdown": 0.00002423,
+        "join_elimination": 0.00000231,
+        "join_filter_pushdown": 6.2e-7,
+        "join_order": 0.00051651,
+        "limit_pushdown": 5.5e-7,
+        "outer_join_simplification": 0.00000347,
+        "partitioned_execution": 9e-7,
+        "projection_placement": 0.0000022,
+        "projection_pullup": 0.00000247,
+        "redundant_order_keys": 0.00000148,
+        "regex_range": 5.9e-7,
+        "reorder_filter": 4.1e-7,
+        "row_group_pruner": 5.9e-7,
+        "row_number_rewriter": 7.9e-7,
+        "sampling_pushdown": 4e-7,
+        "statistics_propagation": 0.00034475,
+        "top_n": 6.1e-7,
+        "top_n_window_elimination": 0.00000507,
+        "total_time": 0.05724451,
+        "type_pushdown": 0.00000268,
+        "unnest_rewriter": 0.00000166,
+        "unused_columns": 0.00001456,
+        "window_self_join": 7e-7
+    },
+    "physical_planner": {
+        "column_binding": 0.00000859,
+        "create_plan": 0.00011253,
+        "resolve_types": 0.00000233,
+        "total_time": 0.00005091
+    },
+    "planner": {
+        "binding_time": 0.04412479,
+        "total_time": 0.04417187
+    },
+    "query": {
+        "cpu_time": 0.039926851,
+        "sql": "SELECT COUNT(*) AS count FROM read_parquet('/home/ubuntu/data/hits_full.parquet') WHERE URL LIKE '%google%'",
+        "total_intermediate_rows": 1,
+        "total_intermediate_size_bytes": 8,
+        "total_row_groups_scanned": 0,
+        "total_row_groups_to_scan": 0,
+        "total_rows_scanned": 0,
+        "total_time": 0.201557211
+    },
+    "system": {
+        "blocked_thread_time": 0.0,
+        "peak_buffer_memory": 260166,
+        "peak_streaming_buffer_size": 8,
+        "peak_temp_dir_size": 0,
+        "total_memory_allocated": 262144
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "telemetry-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "telemetry_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+instrumentation-model = { path = "../model" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b", features = ["io-ndjson"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b", default-features = false, features = ["ndjson"] }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b", features = ["static-injection"] }
+quent-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+quent-nvtx-events = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+
+[build-dependencies]
+cxx-build = "1"
+# Experimental and unstable: quent's `experimental/vibe/codegen/cpp` (LLM-written, unreviewed
+# upstream, `publish = false`). Its generated C++ API can change on any rev bump; there is no
+# stable C++ generator yet.
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "f4159c8b6bab0398cde5eab9d69db7688dc3043b" }

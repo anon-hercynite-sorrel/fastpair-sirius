@@ -1,0 +1,1327 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Unit tests for the pure decision helpers that drive the multi-partition
+// (one-hash-table-per-GPU) join path:
+//   - compute_hash_join_partition_strategy(): the combined natural-count /
+//     broadcast / BUILD_PROBE-eligibility decision a PARTITION operator asks the
+//     hash join for (folds the former make_broadcast_partition_decision and
+//     build_probe_mode_eligible helpers into one).
+//   - select_build_probe_action(): the per-partition state-machine decision used
+//     by get_next_task_hint / get_next_task_input_data_for_build_probe.
+//
+// These are GPU-free and pipeline-free, so they exercise the highest-risk logic
+// (interleaved per-partition build/probe sequencing) deterministically. The
+// end-to-end multi-GPU behavior is covered by the [mgpu] integration tests.
+
+#include "expression/join_condition.hpp"
+#include "helper/type_conversions.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "operator_test_utils.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+
+#include <catch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+
+#include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string_view>
+
+using sirius::op::BUILD_HASH_TABLE_STATE;
+using sirius::op::build_probe_action;
+using sirius::op::build_probe_slot_view;
+using sirius::op::build_probe_slots_to_reclaim;
+using sirius::op::compute_hash_join_partition_strategy;
+using sirius::op::HASH_JOIN_MODE;
+using sirius::op::partition_placement;
+using sirius::op::partition_strategy;
+using sirius::op::select_build_probe_action;
+
+namespace {
+
+// Representative test budgets (not the production defaults).
+constexpr uint64_t kMaxBuildBytes    = 500ull * 1024 * 1024;
+constexpr uint64_t kMaxResidentBytes = kMaxBuildBytes;  // resident-payload bound for new-rule cases
+constexpr uint64_t k100MB            = 100ull * 1024 * 1024;
+
+build_probe_slot_view slot(BUILD_HASH_TABLE_STATE state, bool has_build, bool has_probe)
+{
+  build_probe_slot_view v;
+  v.state           = state;
+  v.has_build_batch = has_build;
+  v.has_probe_batch = has_probe;
+  return v;
+}
+
+}  // namespace
+
+//===----------------------------------------------------------------------===//
+// compute_hash_join_partition_strategy
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// A large hash_partition_bytes so the natural count is 1 unless a test deliberately makes the input
+// exceed it; keeps the "small input" cases at a single natural partition.
+constexpr uint64_t kBigPartitionBytes = 512ull * 1024 * 1024;  // 512 MB
+
+// Default broadcast size cap (256 MB); some tests override it to exercise the ratio-based path.
+constexpr uint64_t kMaxBroadcastBytes = 256ull * 1024 * 1024;
+
+// GPU ids {0, ..., num_gpus - 1}; zero GPUs yields the empty list of an engine-free operator.
+std::vector<int> gpu_ids(int num_gpus)
+{
+  std::vector<int> ids;
+  for (int i = 0; i < num_gpus; ++i) {
+    ids.push_back(i);
+  }
+  return ids;
+}
+
+// Omitted rows model a 16-byte row width; explicit nullopt models unavailable metadata.
+partition_strategy strategy(uint64_t total_bytes,
+                            bool is_build_side,
+                            bool build_foldable,
+                            int num_gpus,
+                            duckdb::JoinType join_type,
+                            HASH_JOIN_MODE join_mode              = HASH_JOIN_MODE::STANDARD,
+                            uint64_t hash_partition_bytes         = kBigPartitionBytes,
+                            uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
+                            uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
+                            double estimated_probe_to_build_ratio = 0.0,
+                            std::optional<uint64_t> total_rows    = 0,
+                            std::optional<uint64_t> max_build_probe_resident_bytes = std::nullopt)
+{
+  auto result = compute_hash_join_partition_strategy(
+    total_bytes,
+    total_rows && *total_rows == 0
+      ? std::optional<uint64_t>{total_bytes / 16 + (total_bytes % 16 != 0)}
+      : total_rows,
+    is_build_side,
+    build_foldable,
+    gpu_ids(num_gpus),
+    /*single_partition_rotation=*/0,
+    hash_partition_bytes,
+    max_build_hash_table_bytes,
+    max_build_probe_resident_bytes.value_or(max_build_hash_table_bytes),
+    max_broadcast_join_size,
+    join_type,
+    join_mode,
+    estimated_probe_to_build_ratio);
+  // Every strategy places exactly the partitions it asks for.
+  REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
+  return result;
+}
+
+}  // namespace
+
+TEST_CASE("compute_hash_join_partition_strategy - single-GPU small foldable inner is BUILD_PROBE",
+          "[hash_join][build_probe][unit]")
+{
+  auto const s = strategy(
+    k100MB, /*is_build_side=*/true, /*foldable=*/true, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy rejects a zero partition target",
+          "[hash_join][build_probe][unit][config]")
+{
+  REQUIRE_THROWS_AS(strategy(k100MB,
+                             /*is_build_side=*/true,
+                             /*build_foldable=*/true,
+                             /*num_gpus=*/1,
+                             duckdb::JoinType::INNER,
+                             HASH_JOIN_MODE::STANDARD,
+                             /*hash_partition_bytes=*/0),
+                    std::invalid_argument);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU build over the batch target still "
+  "BUILD_PROBEs within the hash-table budget",
+  "[hash_join][build_probe][unit]")
+{
+  // 4 natural partitions (400 MB / 100 MB), but the folded build fits the 500 MB hash-table
+  // budget — the batch target must not veto BUILD_PROBE, so this collapses to one partition.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/kMaxBuildBytes);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU build over both targets splits and stays "
+  "STANDARD",
+  "[hash_join][build_probe][unit]")
+{
+  // Same 4 natural partitions, but the build also exceeds the hash-table budget (400 MB > 200 MB),
+  // so there is no single-table shape to fall back to and the natural count is reported.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/2 * k100MB);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU build over the per-GPU cap is STANDARD",
+  "[hash_join][build_probe][unit]")
+{
+  // One natural partition (huge hash_partition_bytes), but the full build exceeds the cap.
+  auto const s = strategy(/*total=*/6 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/1024ull * 1024 * 1024,
+                          /*max_build_hash_table_bytes=*/kMaxBuildBytes);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build just over hash_partition_bytes is BUILD_PROBE",
+  "[hash_join][build_probe][unit]")
+{
+  // TPC-H SF1000 q21: 5.94 GB build, 5 GiB batch target (natural count 2), 10 GiB hash-table
+  // budget — fits one hash table, so BUILD_PROBE on one partition.
+  auto const s = strategy(/*total=*/5'937'804'664ull,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/5ull * 1024 * 1024 * 1024,
+                          /*max_build_hash_table_bytes=*/10ull * 1024 * 1024 * 1024);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - multi-GPU medium build is one-per-GPU BUILD_PROBE",
+  "[hash_join][build_probe][unit]")
+{
+  // 400 MB on 4 GPUs, 100 MB per partition: not small enough to broadcast, but each GPU's slice
+  // fits the cap -> hash-partitioned BUILD_PROBE, one partition per GPU, no broadcast.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multi-GPU small build broadcasts to every GPU",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // 10 MB build on 4 GPUs is below the small-table threshold (4 * 16 MB) -> replicate to every GPU.
+  auto const s = strategy(10ull * 1024 * 1024, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - medium build broadcasts when the probe dwarfs the build",
+  "[hash_join][build_probe][unit][broadcast]")
+{
+  // 100 MB build on 4 GPUs: above the small-table threshold (64 MB) but below max_broadcast (256
+  // MB), and the probe is 6x the build (>= 4 * 1.25 = 5.0) -> broadcast the medium build.
+  auto const s = strategy(100ull * 1024 * 1024,
+                          /*is_build_side=*/true,
+                          /*foldable=*/true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/6.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - medium build hash-partitions when the ratio is too low",
+  "[hash_join][build_probe][unit]")
+{
+  // Same 100 MB build on 4 GPUs, but the probe is only 3x the build (< 5.0) -> no broadcast; it
+  // hash-partitions one-per-GPU instead (still BUILD_PROBE by size).
+  auto const s = strategy(100ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build above max_broadcast_join_size never "
+  "ratio-broadcasts",
+  "[hash_join][build_probe][unit]")
+{
+  // 300 MB build exceeds max_broadcast (256 MB); even a huge probe-to-build ratio cannot broadcast.
+  auto const s = strategy(300ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/100.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - ratio broadcast threshold scales with num_gpus",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // 200 MB build, probe 3x the build. Above the small-table threshold at both GPU counts and below
+  // max_broadcast. The ratio bar is num_gpus * 1.25: 2.5 at 2 GPUs (3.0 clears it -> broadcast),
+  // 10.0 at 8 GPUs (3.0 misses it -> hash-partition).
+  auto const two_gpu = strategy(200ull * 1024 * 1024,
+                                true,
+                                true,
+                                /*num_gpus=*/2,
+                                duckdb::JoinType::INNER,
+                                HASH_JOIN_MODE::STANDARD,
+                                kBigPartitionBytes,
+                                kMaxBuildBytes,
+                                kMaxBroadcastBytes,
+                                /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(two_gpu.num_partitions == 2);
+  REQUIRE(two_gpu.broadcast);
+
+  auto const eight_gpu = strategy(200ull * 1024 * 1024,
+                                  true,
+                                  true,
+                                  /*num_gpus=*/8,
+                                  duckdb::JoinType::INNER,
+                                  HASH_JOIN_MODE::STANDARD,
+                                  kBigPartitionBytes,
+                                  kMaxBuildBytes,
+                                  kMaxBroadcastBytes,
+                                  /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(eight_gpu.num_partitions == 8);
+  REQUIRE_FALSE(eight_gpu.broadcast);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - right-family joins never broadcast/build-probe",
+          "[hash_join][build_probe][unit]")
+{
+  // Probe-driven right-family sizing: is_build_side is false -> plain natural count.
+  auto const probe_driven = strategy(10ull * 1024 * 1024,
+                                     /*is_build_side=*/false,
+                                     true,
+                                     /*num_gpus=*/4,
+                                     duckdb::JoinType::RIGHT);
+  REQUIRE(probe_driven.num_partitions == 1);
+  REQUIRE_FALSE(probe_driven.broadcast);
+  REQUIRE_FALSE(probe_driven.build_probe);
+
+  // Even if the build side drives sizing, RIGHT is excluded from BUILD_PROBE, so a small build
+  // falls back to the natural count instead of broadcasting.
+  auto const build_driven = strategy(10ull * 1024 * 1024,
+                                     /*is_build_side=*/true,
+                                     true,
+                                     /*num_gpus=*/4,
+                                     duckdb::JoinType::RIGHT);
+  REQUIRE(build_driven.num_partitions == 1);
+  REQUIRE_FALSE(build_driven.broadcast);
+  REQUIRE_FALSE(build_driven.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - MARK partitions like SEMI",
+          "[hash_join][build_probe][unit][mark]")
+{
+  // A MARK's global build facts are observed while the build is partitioned, so MARK takes
+  // SEMI's strategy for every shape (no forced BUILD_PROBE, clamp, or broadcast).
+  struct shape {
+    uint64_t total_bytes;
+    int num_gpus;
+    uint64_t hash_partition_bytes;
+  };
+  for (auto const& c : {shape{k100MB, 1, kBigPartitionBytes},
+                        shape{8 * k100MB, 1, k100MB},
+                        shape{6 * k100MB, 1, 1024ull * 1024 * 1024},
+                        shape{k100MB, 4, kBigPartitionBytes},
+                        shape{6 * k100MB, 4, k100MB},
+                        shape{40 * k100MB, 4, k100MB}}) {
+    CAPTURE(c.total_bytes, c.num_gpus, c.hash_partition_bytes);
+    auto const semi = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::SEMI,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes);
+    auto const mark = strategy(c.total_bytes,
+                               true,
+                               true,
+                               c.num_gpus,
+                               duckdb::JoinType::MARK,
+                               HASH_JOIN_MODE::STANDARD,
+                               c.hash_partition_bytes);
+    REQUIRE(mark.num_partitions == semi.num_partitions);
+    REQUIRE(mark.broadcast == semi.broadcast);
+    REQUIRE(mark.build_probe == semi.build_probe);
+  }
+
+  // The q21 shape: a single-GPU build over the hash-table cap and over hash_partition_bytes runs
+  // STANDARD at the natural count instead of one forced whole-build BUILD_PROBE partition.
+  auto const large = strategy(8 * k100MB,
+                              true,
+                              true,
+                              /*num_gpus=*/1,
+                              duckdb::JoinType::MARK,
+                              HASH_JOIN_MODE::STANDARD,
+                              /*hash_partition_bytes=*/k100MB);
+  REQUIRE(large.num_partitions > 1);
+  REQUIRE_FALSE(large.broadcast);
+  REQUIRE_FALSE(large.build_probe);
+
+  // A small MARK build still folds into one BUILD_PROBE hash table.
+  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
+  REQUIRE(small.num_partitions == 1);
+  REQUIRE(small.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldable stay STANDARD",
+          "[hash_join][build_probe][unit]")
+{
+  // Mixed join (equality + inequality) never uses BUILD_PROBE.
+  auto const mixed = strategy(
+    k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+  REQUIRE_FALSE(mixed.build_probe);
+
+  // Full outer over-emits unmatched build rows on the streamed path -> excluded.
+  auto const outer = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::OUTER);
+  REQUIRE_FALSE(outer.build_probe);
+
+  // Build side that cannot fold to a single batch -> excluded.
+  auto const unfoldable =
+    strategy(k100MB, true, /*foldable=*/false, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE_FALSE(unfoldable.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - lone STANDARD partition follows locality",
+          "[hash_join][build_probe][partition_placement][unit]")
+{
+  for (int num_gpus : {1, 4}) {
+    for (auto join_type :
+         {duckdb::JoinType::INNER, duckdb::JoinType::OUTER, duckdb::JoinType::RIGHT}) {
+      // An unfoldable build stays STANDARD; right-family joins are probe-driven.
+      bool const build_driven = join_type != duckdb::JoinType::RIGHT;
+      auto const s            = strategy(1024 * 1024, build_driven, false, num_gpus, join_type);
+      REQUIRE(s.num_partitions == 1);
+      REQUIRE_FALSE(s.build_probe);
+      REQUIRE_FALSE(s.broadcast);
+      sirius::op::partitioned_operator_data input({}, 0, s.placement);
+      CHECK(input.get_partition_idx() == std::optional<std::size_t>{0});
+      CHECK_FALSE(input.get_preferred_device_id().has_value());
+    }
+    auto const mixed = strategy(
+      1024 * 1024, true, true, num_gpus, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+    CHECK_FALSE(mixed.placement.any_pinned());
+  }
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multiple STANDARD partitions stay pinned",
+          "[hash_join][build_probe][partition_placement][unit]")
+{
+  for (bool build_driven : {false, true}) {
+    auto const s =
+      strategy(4 * kBigPartitionBytes, build_driven, false, 4, duckdb::JoinType::INNER);
+    REQUIRE_FALSE(s.build_probe);
+    REQUIRE(s.num_partitions == 4);
+    CHECK(s.placement == partition_placement::round_robin(4, {0, 1, 2, 3}));
+  }
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - no GPU list plans one GPU, unpinned",
+          "[hash_join][build_probe][unit]")
+{
+  auto const none = strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER);
+  auto const one  = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE(none.num_partitions == one.num_partitions);
+  REQUIRE(none.build_probe == one.build_probe);
+  REQUIRE(none.broadcast == one.broadcast);
+  REQUIRE_FALSE(none.placement.any_pinned());
+  REQUIRE(one.placement == partition_placement::round_robin(1, {0}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - broadcast places one partition per GPU",
+          "[hash_join][build_probe][unit]")
+{
+  // 1 MB is below the 4-GPU small-table threshold (64 MB), so the build is replicated.
+  auto const s = strategy(1024ull * 1024, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.placement == partition_placement::one_per_device({0, 1, 2, 3}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multi-partition BUILD_PROBE is round-robin",
+          "[hash_join][build_probe][unit]")
+{
+  // 4 GB over 4 GPUs: too big to broadcast, one 1 GB hash table per GPU.
+  auto const s = strategy(4096ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/2048ull * 1024 * 1024);
+  REQUIRE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.placement == partition_placement::round_robin(4, {0, 1, 2, 3}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - a lone BUILD_PROBE partition rotates by seed",
+          "[hash_join][build_probe][unit]")
+{
+  // Today's count policy only yields a single BUILD_PROBE partition on one GPU (on more, a small
+  // build broadcasts and a larger one is floored to one partition per GPU), so the rotation picks
+  // among a single id. The rotation is what lets a future fewer-GPUs policy spread lone joins.
+  auto const s = compute_hash_join_partition_strategy(k100MB,
+                                                      k100MB / 16,
+                                                      /*is_build_side=*/true,
+                                                      /*build_foldable=*/true,
+                                                      /*active_gpu_ids=*/{3},
+                                                      /*single_partition_rotation=*/5,
+                                                      kBigPartitionBytes,
+                                                      kMaxBuildBytes,
+                                                      kMaxResidentBytes,
+                                                      kMaxBroadcastBytes,
+                                                      duckdb::JoinType::INNER,
+                                                      HASH_JOIN_MODE::STANDARD,
+                                                      /*estimated_probe_to_build_ratio=*/0.0);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.placement.device_for(0) == 3);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - wide-payload/narrow-key build is admitted on measured "
+  "rows",
+  "[hash_join][build_probe][unit]")
+{
+  // 2 GB payload but only 2M rows: the estimated cuco table is 2M x 16 B = 32 MB, far under the
+  // 500 MB hash-table budget even though the payload dwarfs it. With resident headroom (4 GB) the
+  // build takes BUILD_PROBE on one partition instead of a STANDARD rebuild-per-pair split.
+  auto const s = strategy(2048ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/0.0,
+                          /*total_rows=*/2'000'000,
+                          /*max_build_probe_resident_bytes=*/4096ull * 1024 * 1024);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build whose estimated table exceeds the capacity "
+  "budget stays STANDARD",
+  "[hash_join][build_probe][unit]")
+{
+  // 100 MB payload fits both byte bounds, but 40M rows estimate a 640 MB cuco table (>= 500 MB)
+  // -> denied on capacity, natural count (one partition at this size).
+  auto const s = strategy(k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/0.0,
+                          /*total_rows=*/40'000'000,
+                          kMaxResidentBytes);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build whose payload exceeds the resident budget stays "
+  "STANDARD",
+  "[hash_join][build_probe][unit]")
+{
+  // 1M rows estimate a tiny 16 MB table, but the 600 MB payload would sit GPU-resident and
+  // un-spillable for the whole probe stream (>= 500 MB) -> denied on the resident bound.
+  auto const s = strategy(600ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/0.0,
+                          /*total_rows=*/1'000'000,
+                          kMaxResidentBytes);
+  REQUIRE(s.num_partitions == 2);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - MARK respects both BUILD_PROBE bounds",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // 2 GB payload and 100M rows (1.6 GB estimated table) exceed the per-GPU budgets.
+  // MARK uses STANDARD at the natural count instead of forcing a whole-build table or broadcast.
+  auto const single = strategy(2048ull * 1024 * 1024,
+                               true,
+                               true,
+                               /*num_gpus=*/1,
+                               duckdb::JoinType::MARK,
+                               HASH_JOIN_MODE::STANDARD,
+                               kBigPartitionBytes,
+                               kMaxBuildBytes,
+                               kMaxBroadcastBytes,
+                               /*estimated_probe_to_build_ratio=*/0.0,
+                               /*total_rows=*/100'000'000,
+                               kMaxResidentBytes);
+  REQUIRE(single.num_partitions == 4);
+  REQUIRE_FALSE(single.broadcast);
+  REQUIRE_FALSE(single.build_probe);
+
+  auto const multi = strategy(2048ull * 1024 * 1024,
+                              true,
+                              true,
+                              /*num_gpus=*/4,
+                              duckdb::JoinType::MARK,
+                              HASH_JOIN_MODE::STANDARD,
+                              kBigPartitionBytes,
+                              kMaxBuildBytes,
+                              kMaxBroadcastBytes,
+                              /*estimated_probe_to_build_ratio=*/0.0,
+                              /*total_rows=*/100'000'000,
+                              kMaxResidentBytes);
+  REQUIRE(multi.num_partitions == 4);
+  REQUIRE_FALSE(multi.broadcast);
+  REQUIRE_FALSE(multi.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a broadcast candidate charges the full build to every "
+  "GPU",
+  "[hash_join][build_probe][unit][broadcast]")
+{
+  // Rows: a 10 MB build on 4 GPUs is below the small-table threshold (64 MB), so it is a
+  // broadcast candidate and its FULL 40M rows (640 MB estimated table) are charged to every GPU
+  // -- denied, even though the per-GPU average (160 MB) would fit.
+  auto const rows_denied = strategy(10ull * 1024 * 1024,
+                                    true,
+                                    true,
+                                    /*num_gpus=*/4,
+                                    duckdb::JoinType::INNER,
+                                    HASH_JOIN_MODE::STANDARD,
+                                    kBigPartitionBytes,
+                                    kMaxBuildBytes,
+                                    kMaxBroadcastBytes,
+                                    /*estimated_probe_to_build_ratio=*/0.0,
+                                    /*total_rows=*/40'000'000,
+                                    kMaxResidentBytes);
+  REQUIRE_FALSE(rows_denied.build_probe);
+  REQUIRE_FALSE(rows_denied.broadcast);
+  REQUIRE(rows_denied.num_partitions == 1);
+
+  // Bytes: same broadcast-candidate build against an 8 MB resident budget -- the FULL 10 MB
+  // payload exceeds it (the per-GPU average, 2.5 MB, would not) -> denied.
+  auto const bytes_denied = strategy(10ull * 1024 * 1024,
+                                     true,
+                                     true,
+                                     /*num_gpus=*/4,
+                                     duckdb::JoinType::INNER,
+                                     HASH_JOIN_MODE::STANDARD,
+                                     kBigPartitionBytes,
+                                     kMaxBuildBytes,
+                                     kMaxBroadcastBytes,
+                                     /*estimated_probe_to_build_ratio=*/0.0,
+                                     /*total_rows=*/1'000,
+                                     /*max_build_probe_resident_bytes=*/8ull * 1024 * 1024);
+  REQUIRE_FALSE(bytes_denied.build_probe);
+  REQUIRE_FALSE(bytes_denied.broadcast);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - hash-partitioned build charges the per-GPU average "
+  "rows",
+  "[hash_join][build_probe][unit]")
+{
+  // 400 MB / 40M rows on 4 GPUs, not a broadcast candidate: the full 640 MB table estimate
+  // exceeds the budget, but each GPU's quarter (160 MB table, 100 MB payload) fits both bounds
+  // -> hash-partitioned BUILD_PROBE, one partition per GPU.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/0.0,
+                          /*total_rows=*/40'000'000,
+                          kMaxResidentBytes);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - new defaults admit every build the legacy payload rule "
+  "admitted",
+  "[hash_join][build_probe][unit]")
+{
+  // The legacy rule admitted BUILD_PROBE when payload < max_build_hash_table_bytes, which
+  // defaulted to 2x the batch default. Both bounds now default to 8x batch; a >= 4x ratio keeps
+  // every legacy-admitted build with average row width >= 4 B/row admitted (rows x 16 <=
+  // payload x 4), so shrinking the defaults below that point fails this sweep loudly.
+  constexpr uint64_t kLegacyDefaultBudget = 2 * sirius::config::DEFAULT_BATCH_SIZE;
+  constexpr uint64_t kTableBoundScale =
+    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES / kLegacyDefaultBudget;
+  constexpr uint64_t kResidentBoundScale =
+    sirius::config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES / kLegacyDefaultBudget;
+  STATIC_REQUIRE(kTableBoundScale >= 4);
+  STATIC_REQUIRE(kResidentBoundScale >= 4);
+
+  // A reference deployment budget (the long-standing 90 MB yaml value), scaled by the same ratio
+  // the defaults were.
+  constexpr uint64_t kOldBudget = 90ull * 1000 * 1000;
+  for (uint64_t const width : {4, 8, 16, 64, 256}) {
+    for (uint64_t const payload : {1ull * 1024 * 1024, 89ull * 1000 * 1000}) {
+      INFO("width=" << width << " payload=" << payload);
+      REQUIRE(payload < kOldBudget);  // admitted under the legacy payload rule
+      auto const s = strategy(payload,
+                              true,
+                              true,
+                              /*num_gpus=*/1,
+                              duckdb::JoinType::INNER,
+                              HASH_JOIN_MODE::STANDARD,
+                              kBigPartitionBytes,
+                              kOldBudget * kTableBoundScale,
+                              kMaxBroadcastBytes,
+                              /*estimated_probe_to_build_ratio=*/0.0,
+                              /*total_rows=*/payload / width,
+                              kOldBudget * kResidentBoundScale);
+      REQUIRE(s.build_probe);
+    }
+  }
+}
+
+TEST_CASE("compute_hash_join_partition_strategy declines unmeasured build rows including MARK",
+          "[hash_join][build_probe][unit]")
+{
+  for (auto const type : {duckdb::JoinType::INNER, duckdb::JoinType::MARK}) {
+    auto const s = strategy(4 * k100MB,
+                            true,
+                            true,
+                            1,
+                            type,
+                            HASH_JOIN_MODE::STANDARD,
+                            k100MB,
+                            kMaxBuildBytes,
+                            kMaxBroadcastBytes,
+                            0.0,
+                            std::nullopt,
+                            kMaxResidentBytes);
+    REQUIRE_FALSE(s.build_probe);
+    REQUIRE(s.num_partitions == 4);
+  }
+}
+
+TEST_CASE("compute_hash_join_partition_strategy rounds per-GPU rows upward",
+          "[hash_join][build_probe][unit]")
+{
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          k100MB,
+                          25,
+                          kMaxBroadcastBytes,
+                          0.0,
+                          5,
+                          kMaxResidentBytes);
+  REQUIRE_FALSE(s.build_probe);  // ceil(5 / 4) * 16 = 32, not 16.
+}
+
+TEST_CASE("compute_hash_join_partition_strategy bounds decoded residency of compressed builds",
+          "[hash_join][build_probe][unit]")
+{
+  auto const s = compute_hash_join_partition_strategy(1024,
+                                                      100,
+                                                      true,
+                                                      true,
+                                                      {0},
+                                                      0,
+                                                      kBigPartitionBytes,
+                                                      kMaxBuildBytes,
+                                                      kMaxResidentBytes,
+                                                      kMaxBroadcastBytes,
+                                                      duckdb::JoinType::INNER,
+                                                      HASH_JOIN_MODE::STANDARD,
+                                                      0.0,
+                                                      /*resident_bytes=*/kMaxResidentBytes);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy rejects oversized folded row counts",
+          "[hash_join][build_probe][unit]")
+{
+  constexpr auto max_rows = static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  auto const rows         = GENERATE(max_rows + 1, std::numeric_limits<uint64_t>::max());
+  auto const s            = strategy(4 * k100MB,
+                          true,
+                          true,
+                          4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          k100MB,
+                          std::numeric_limits<uint64_t>::max(),
+                          kMaxBroadcastBytes,
+                          0.0,
+                          rows,
+                          kMaxResidentBytes);
+  REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a zero budget disables BUILD_PROBE including MARK",
+  "[hash_join][build_probe][unit]")
+{
+  // Either bound at 0 forces STANDARD, including for MARK joins.
+  auto const zero_table = strategy(1ull * 1024 * 1024,
+                                   true,
+                                   true,
+                                   /*num_gpus=*/1,
+                                   duckdb::JoinType::INNER,
+                                   HASH_JOIN_MODE::STANDARD,
+                                   kBigPartitionBytes,
+                                   /*max_build_hash_table_bytes=*/0,
+                                   kMaxBroadcastBytes,
+                                   /*estimated_probe_to_build_ratio=*/0.0,
+                                   /*total_rows=*/1'000,
+                                   kMaxResidentBytes);
+  REQUIRE_FALSE(zero_table.build_probe);
+
+  auto const zero_resident = strategy(1ull * 1024 * 1024,
+                                      true,
+                                      true,
+                                      /*num_gpus=*/1,
+                                      duckdb::JoinType::INNER,
+                                      HASH_JOIN_MODE::STANDARD,
+                                      kBigPartitionBytes,
+                                      kMaxBuildBytes,
+                                      kMaxBroadcastBytes,
+                                      /*estimated_probe_to_build_ratio=*/0.0,
+                                      /*total_rows=*/1'000,
+                                      /*max_build_probe_resident_bytes=*/0);
+  REQUIRE_FALSE(zero_resident.build_probe);
+
+  auto const mark = strategy(1ull * 1024 * 1024,
+                             true,
+                             true,
+                             /*num_gpus=*/1,
+                             duckdb::JoinType::MARK,
+                             HASH_JOIN_MODE::STANDARD,
+                             kBigPartitionBytes,
+                             /*max_build_hash_table_bytes=*/0,
+                             kMaxBroadcastBytes,
+                             /*estimated_probe_to_build_ratio=*/0.0,
+                             /*total_rows=*/1'000,
+                             /*max_build_probe_resident_bytes=*/0);
+  REQUIRE_FALSE(mark.build_probe);
+}
+
+//===----------------------------------------------------------------------===//
+// select_build_probe_action
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("select_build_probe_action - no partitions means the operator is complete",
+          "[hash_join][build_probe][unit]")
+{
+  auto const d = select_build_probe_action({}, /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::none);
+}
+
+TEST_CASE("select_build_probe_action - schedules a build for a ready NOT_BUILT partition",
+          "[hash_join][build_probe][unit]")
+{
+  // NOT_BUILT with both its build batch and a probe batch -> build (and first probe) it.
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true)},
+                                           /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_build);
+  REQUIRE(d.partition == 0);
+}
+
+TEST_CASE("select_build_probe_action - waits on build vs probe input when nothing is schedulable",
+          "[hash_join][build_probe][unit]")
+{
+  // Missing build batch -> wait for the build producer so the build can start, regardless of
+  // whether the probe side is finished (the build hasn't even arrived).
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_build);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_build);
+
+  // Build batch present but no probe batch yet, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+
+  // A build in flight (SCHEDULING/SCHEDULED) with no other work -> wait for probe input, even
+  // once probe_finished: a task is still running against this slot.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_probe);
+
+  // Built but drained of probe data, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+}
+
+TEST_CASE(
+  "select_build_probe_action - probe_finished retires orphaned/drained slots into completion",
+  "[hash_join][build_probe][unit]")
+{
+  // A NOT_BUILT partition holding a build batch but no probe data (broadcast orphan) has nothing
+  // left to do once the probe side is finished -- it does not need to be torn down first for the
+  // operator to report completion.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // A BUILT-and-drained partition likewise has nothing left to do once probe_finished: this is
+  // the exact state that used to make the operator report wait_for_probe forever.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // Mixed: one already-DESTROYED slot alongside a BUILT-and-drained one -- still complete once
+  // probe_finished.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+                                     slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+}
+
+TEST_CASE("select_build_probe_action - probes a built partition that has probe data",
+          "[hash_join][build_probe][unit]")
+{
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, true)},
+                                           /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_probe);
+  REQUIRE(d.partition == 0);
+}
+
+TEST_CASE("select_build_probe_action - prefers starting a build over probing a built partition",
+          "[hash_join][build_probe][unit]")
+{
+  // Partition 0 is BUILT with probe data; partition 1 is NOT_BUILT and ready. Building 1 first
+  // gets its GPU busy sooner, so build wins.
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_build);
+  REQUIRE(d.partition == 1);
+}
+
+TEST_CASE("select_build_probe_action - interleaves: probes a built partition while another builds",
+          "[hash_join][build_probe][unit]")
+{
+  // Partition 0 is still building (SCHEDULED); partition 1 is BUILT with probe data. With no
+  // NOT_BUILT partition ready to build, we probe partition 1 on its GPU while 0 finishes.
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_probe);
+  REQUIRE(d.partition == 1);
+}
+
+TEST_CASE("select_build_probe_action - a SCHEDULING partition is not re-scheduled",
+          "[hash_join][build_probe][unit]")
+{
+  // Partition 0 was just claimed for build (SCHEDULING) by a prior hint; it must not be picked
+  // again. Partition 1 is BUILT with probe data, so that is the next action.
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, true),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_probe);
+  REQUIRE(d.partition == 1);
+}
+
+TEST_CASE("select_build_probe_action - all partitions destroyed reports completion",
+          "[hash_join][build_probe][unit]")
+{
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::none);
+}
+
+TEST_CASE("select_build_probe_action - first ready build wins across many partitions",
+          "[hash_join][build_probe][unit]")
+{
+  // Partition 0 built+drained, 1 built+drained, 2 NOT_BUILT+ready, 3 NOT_BUILT+ready. The first
+  // schedulable build (partition 2) is chosen.
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.action == build_probe_action::schedule_build);
+  REQUIRE(d.partition == 2);
+}
+
+//===----------------------------------------------------------------------===//
+// build_probe_slots_to_reclaim
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("build_probe_slots_to_reclaim waits for the probe producer", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)}, false);
+  CHECK(candidates.empty());
+}
+
+TEST_CASE("build_probe_slots_to_reclaim selects every never-probed build", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{0, 1, 2});
+}
+
+TEST_CASE("build_probe_slots_to_reclaim preserves probe data and active slots", "[build_probe]")
+{
+  auto const candidates =
+    build_probe_slots_to_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::SCHEDULED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::BUILT, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::DESTROYED, true, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                  slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                 true);
+  CHECK(candidates == std::vector<std::size_t>{6});
+}
+
+TEST_CASE("build_probe_slots_to_reclaim handles a build arriving after probe closure",
+          "[build_probe]")
+{
+  std::vector<build_probe_slot_view> slots{slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+                                           slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)};
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{1});
+  slots[1]                 = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  slots[0].has_build_batch = true;
+  CHECK(build_probe_slots_to_reclaim(slots, true) == std::vector<std::size_t>{0});
+  slots[0] = slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false);
+  CHECK(build_probe_slots_to_reclaim(slots, true).empty());
+}
+
+//===----------------------------------------------------------------------===//
+// primary_input_port — which side the size estimator may extrapolate along
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Exposes the protected mode knob and byte recorder so BUILD_PROBE accounting is testable
+// without a wired pipeline graph.
+struct exposed_hash_join : sirius::op::sirius_physical_hash_join {
+  using sirius_physical_hash_join::note_probe_bytes_counted;
+  using sirius_physical_hash_join::sirius_physical_hash_join;
+
+  void set_build_probe_mode() { _join_mode = sirius::op::HASH_JOIN_MODE::BUILD_PROBE; }
+};
+
+/// Pipeline whose finished state is set directly.
+struct finishable_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit finishable_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+
+  [[nodiscard]] bool is_pipeline_finished() const override { return finished; }
+
+  bool finished = false;
+};
+
+// LogicalComparisonJoin must outlive hash_join, which references op.types.
+struct nomination_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> hash_join;
+};
+
+nomination_fixture make_join(duckdb::JoinType join_type)
+{
+  nomination_fixture f;
+  f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+
+  auto make_child = [] {
+    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+      sirius::op::SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      0);
+  };
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
+  conditions.push_back(std::move(cond));
+
+  f.hash_join = duckdb::make_uniq<exposed_hash_join>(
+    *f.logical_join,
+    make_child(),
+    make_child(),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    duckdb::vector<duckdb::idx_t>{},
+    duckdb::vector<duckdb::idx_t>{},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+    1000);
+  return f;
+}
+
+}  // namespace
+
+TEST_CASE("primary_input_port - probe-streaming joins nominate the probe side",
+          "[hash_join][size_estimation][unit]")
+{
+  // Probe volume is the estimator's open axis for these joins.
+  for (auto const jt : {duckdb::JoinType::INNER,
+                        duckdb::JoinType::LEFT,
+                        duckdb::JoinType::SEMI,
+                        duckdb::JoinType::ANTI,
+                        duckdb::JoinType::MARK}) {
+    auto f = make_join(jt);
+    INFO("join type: " << duckdb::JoinTypeToString(jt));
+    REQUIRE(f.hash_join->primary_input_port() == std::string_view{"default"});
+  }
+}
+
+TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
+          "[hash_join][size_estimation][unit]")
+{
+  // These joins have no probe-side axis the estimator can safely extrapolate.
+  for (auto const jt : {duckdb::JoinType::RIGHT,
+                        duckdb::JoinType::RIGHT_SEMI,
+                        duckdb::JoinType::RIGHT_ANTI,
+                        duckdb::JoinType::OUTER}) {
+    auto f = make_join(jt);
+    INFO("join type: " << duckdb::JoinTypeToString(jt));
+    REQUIRE_FALSE(f.hash_join->primary_input_port().has_value());
+  }
+}
+
+TEST_CASE("refresh_cross_schedule rejects a SEMI or MARK build partition that is not concat-folded",
+          "[hash_join][cross_schedule][build_probe][mark]")
+{
+  static auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  // A hash-partitioned STANDARD MARK, like SEMI, gives each probe row one result per build batch.
+  auto const join_type = GENERATE(duckdb::JoinType::SEMI, duckdb::JoinType::MARK);
+  CAPTURE(duckdb::JoinTypeToString(join_type));
+  auto f                   = make_join(join_type);
+  f.hash_join->operator_id = 1;
+  cucascade::shared_data_repository build_repo;
+  cucascade::shared_data_repository probe_repo;
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
+  for (auto [name, repo] : {std::pair{"build", &build_repo}, std::pair{"default", &probe_repo}}) {
+    auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();
+    port->repo         = repo;
+    port->src_pipeline = name == std::string_view{"build"}
+                           ? build_pipeline
+                           : std::make_shared<finishable_pipeline>(ctx);
+    f.hash_join->add_port(name, std::move(port));
+  }
+  auto batch = [&] {
+    return sirius::test::operator_utils::make_numeric_batch<int32_t>(
+      *space, {1}, cudf::type_id::INT32);
+  };
+  probe_repo.add_data_batch(batch());
+  build_repo.add_data_batch(batch());
+  build_pipeline->finished = true;
+
+  // One folded build batch per partition is the invariant.
+  REQUIRE_NOTHROW(f.hash_join->refresh_cross_schedule());
+
+  // A second build batch in the same partition after the build finished would let SEMI emit (or
+  // MARK mark) a probe row once per build batch.
+  build_repo.add_data_batch(batch());
+  REQUIRE_THROWS_WITH(f.hash_join->refresh_cross_schedule(),
+                      Catch::Matchers::ContainsSubstring("single concat-folded build batch"));
+}
+
+TEST_CASE("probe bytes are only unweighted in BUILD_PROBE mode",
+          "[hash_join][size_estimation][unit]")
+{
+  // Only BUILD_PROBE, which pops each probe batch exactly once, reports a consumed total; a
+  // cross schedule would need pairing weights, which are biased under skew.
+  auto f = make_join(duckdb::JoinType::INNER);
+  CHECK_FALSE(f.hash_join->probe_bytes_are_unweighted());
+  // consumed_primary_input_bytes() gates on the same predicate before anything else.
+  CHECK_FALSE(f.hash_join->consumed_primary_input_bytes().has_value());
+}
+
+TEST_CASE("BUILD_PROBE byte accounting - accumulation, dedup, and the build-finished gate",
+          "[hash_join][size_estimation][unit]")
+{
+  auto f  = make_join(duckdb::JoinType::INNER);
+  auto* j = static_cast<exposed_hash_join*>(f.hash_join.get());
+  j->set_build_probe_mode();
+  REQUIRE(j->probe_bytes_are_unweighted());
+
+  // Without a build port the accessor cannot know the build side finished.
+  CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
+
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
+  auto port           = std::make_unique<sirius::op::sirius_physical_operator::port>();
+  port->src_pipeline  = build_pipeline;
+  j->add_port("build", std::move(port));
+
+  // Bytes recorded while the build side is still open are withheld...
+  j->note_probe_bytes_counted(7, 1000);
+  j->note_probe_bytes_counted(8, 500);
+  CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
+
+  // ...and reported once it finishes.
+  build_pipeline->finished = true;
+  CHECK(j->consumed_primary_input_bytes() == std::size_t{1500});
+
+  // An OOM-rescheduled task re-enters execute() with the same batch id; the dedup counts it once,
+  // whatever size the retry reads.
+  j->note_probe_bytes_counted(7, 999999);
+  CHECK(j->consumed_primary_input_bytes() == std::size_t{1500});
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - SINGLE schedules like LEFT",
+          "[hash_join][build_probe][unit]")
+{
+  // SINGLE needs no whole-build mode of its own: its build is concat-folded per partition like
+  // LEFT's, so BUILD_PROBE eligibility follows the same admission rules.
+  for (auto const bytes : {k100MB, 8 * k100MB}) {
+    INFO("build bytes: " << bytes);
+    auto const left   = strategy(bytes,
+                               /*is_build_side=*/true,
+                               /*build_foldable=*/true,
+                               /*num_gpus=*/1,
+                               duckdb::JoinType::LEFT,
+                               HASH_JOIN_MODE::STANDARD,
+                               /*hash_partition_bytes=*/k100MB);
+    auto const single = strategy(bytes,
+                                 /*is_build_side=*/true,
+                                 /*build_foldable=*/true,
+                                 /*num_gpus=*/1,
+                                 duckdb::JoinType::SINGLE,
+                                 HASH_JOIN_MODE::STANDARD,
+                                 /*hash_partition_bytes=*/k100MB);
+    REQUIRE(single.build_probe == left.build_probe);
+    REQUIRE(single.broadcast == left.broadcast);
+    REQUIRE(single.num_partitions == left.num_partitions);
+  }
+  REQUIRE(strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::SINGLE).build_probe);
+  REQUIRE_FALSE(strategy(8 * k100MB,
+                         true,
+                         true,
+                         /*num_gpus=*/1,
+                         duckdb::JoinType::SINGLE,
+                         HASH_JOIN_MODE::STANDARD,
+                         /*hash_partition_bytes=*/k100MB)
+                  .build_probe);
+}

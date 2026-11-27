@@ -1,0 +1,314 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "catch.hpp"
+#include "scan/test_utils.hpp"
+#include "sirius_config.hpp"
+#include "sirius_extension.hpp"
+#include "telemetry/nvtx_injection.hpp"
+#include "telemetry/telemetry_context.hpp"
+#include "utils/child_process_environment.hpp"
+#include "utils/sirius_test_env.hpp"
+
+#include <dlfcn.h>
+#include <spawn.h>
+#include <sys/wait.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+using namespace sirius;
+using namespace sirius::telemetry;
+
+extern "C" int InitializeInjectionNvtx2(void* get_export_table);
+
+namespace {
+
+class scoped_env_restore {
+ public:
+  explicit scoped_env_restore(const char* name) : name_(name)
+  {
+    if (auto const* value = std::getenv(name)) { original_ = value; }
+  }
+
+  ~scoped_env_restore()
+  {
+    if (original_) {
+      ::setenv(name_.c_str(), original_->c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+  scoped_env_restore(scoped_env_restore const&)            = delete;
+  scoped_env_restore& operator=(scoped_env_restore const&) = delete;
+
+ private:
+  std::string name_;
+  std::optional<std::string> original_;
+};
+
+std::string uuid_str(const quent::Uuid& id) { return quent::to_string(id); }
+
+/// Read every line of every ndjson file that the quent context wrote.
+std::vector<std::string> read_all_telemetry_lines(const std::filesystem::path& dir,
+                                                  std::string_view entity = {})
+{
+  std::vector<std::string> lines;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
+    if (!entry.is_regular_file() || entry.path().extension() != ".ndjson") { continue; }
+    if (!entity.empty() && entry.path().parent_path().filename().string() != entity) { continue; }
+    std::ifstream in(entry.path());
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty()) { lines.push_back(line); }
+    }
+  }
+  return lines;
+}
+
+bool any_line_with_all(const std::vector<std::string>& lines,
+                       const std::vector<std::string>& needles)
+{
+  for (const auto& line : lines) {
+    bool all = true;
+    for (const auto& needle : needles) {
+      if (line.find(needle) == std::string::npos) {
+        all = false;
+        break;
+      }
+    }
+    if (all) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_CASE("fresh runtime startup captures the libcucascade domain only when opted in",
+          "[telemetry_context][isolated_context]")
+{
+  auto const enable_quent = GENERATE(false, true);
+  auto const nvtx_setting =
+    GENERATE(std::string{"default"}, std::string{"false"}, std::string{"true"});
+  auto const use_ffi = GENERATE(false, true);
+  CAPTURE(enable_quent, nvtx_setting, use_ffi);
+  auto const root =
+    std::filesystem::temp_directory_path() / ("sirius_nvtx_startup_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  auto const config_path = root / "sirius.yaml";
+  auto const output      = root / "telemetry";
+  {
+    std::ofstream config(config_path);
+    config << "sirius:\n"
+              "  topology: { num_gpus: 1 }\n"
+              "  memory:\n"
+              "    gpu: { usage_limit_fraction: 0.1 }\n"
+              "    host: { capacity_bytes: 2Gi, initial_number_pools: 1, pool_size: 128 }\n"
+              "  executor:\n"
+              "    pipeline: { num_threads: 1 }\n"
+              "    task_creator: { num_threads: 1 }\n"
+              "  telemetry:\n"
+              "    enable_quent: "
+           << (enable_quent ? "true" : "false") << '\n';
+    if (nvtx_setting != "default") { config << "    enable_nvtx: " << nvtx_setting << '\n'; }
+    config << "    exporter: ndjson\n"
+              "    output_directory: "
+           << output.string() << '\n';
+    REQUIRE(config.good());
+  }
+
+  // NVTX caches domain handles and Quent's hook is installed once per process.
+  // Use a fresh helper without the unit runner's shared environment startup.
+  // FFI initializes its own runtime; disable the embedded DuckDB's automatic one.
+  sirius::test::child_process_environment environment{
+    {{"SIRIUS_DISABLE", use_ffi ? "1" : "0"},
+     {"SIRIUS_CONFIG_FILE", config_path.string()},
+     {"SIRIUS_LOG_DIR", (root / "logs").string()}},
+    {"NVTX_INJECTION64_PATH", "NVTX_INJECTION32_PATH"}};
+  auto executable =
+    (std::filesystem::canonical("/proc/self/exe").parent_path() / "sirius_nvtx_startup").string();
+  std::string mode  = use_ffi ? "ffi" : "duckdb";
+  char* arguments[] = {executable.data(), mode.data(), nullptr};
+  pid_t child{};
+  REQUIRE(::posix_spawn(
+            &child, executable.c_str(), nullptr, nullptr, arguments, environment.data()) == 0);
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  int status{};
+  bool finished = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto const result = ::waitpid(child, &status, WNOHANG);
+    if (result == child) {
+      finished = true;
+      break;
+    }
+    if (result < 0 && errno != EINTR) { break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (!finished) {
+    (void)::kill(child, SIGKILL);
+    (void)::waitpid(child, &status, 0);
+  }
+  INFO("NVTX startup artifacts: " << root);
+  REQUIRE(finished);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+  if (enable_quent) {
+    REQUIRE(std::filesystem::is_directory(output));
+    REQUIRE_FALSE(read_all_telemetry_lines(output).empty());
+  }
+  auto const lines = std::filesystem::is_directory(output)
+                       ? read_all_telemetry_lines(output, "NvtxEvent")
+                       : std::vector<std::string>{};
+  if (enable_quent && nvtx_setting == "true") {
+    REQUIRE(any_line_with_all(lines, {"\"DomainCreate\"", "\"name\":\"libcucascade\""}));
+    REQUIRE(any_line_with_all(lines, {"\"RangePush\"", "topology:discover"}));
+  } else {
+    REQUIRE(lines.empty());
+  }
+  std::filesystem::remove_all(root);
+}
+
+TEST_CASE("SIRIUS_DISABLE skips automatic NVTX injection discovery",
+          "[telemetry_context][isolated_context]")
+{
+  scoped_env_restore restore_disable{"SIRIUS_DISABLE"};
+  scoped_env_restore restore_nvtx_path{"NVTX_INJECTION64_PATH"};
+  ::setenv("SIRIUS_DISABLE", "1", /*overwrite=*/1);
+  ::unsetenv("NVTX_INJECTION64_PATH");
+
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::SiriusExtension extension;
+    REQUIRE(db.ExtensionIsLoaded(extension.Name()));
+  }
+
+  CHECK(std::getenv("NVTX_INJECTION64_PATH") == nullptr);
+}
+
+TEST_CASE("static NVTX injection path resolves the host initializer", "[telemetry_context]")
+{
+  auto* handle = ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+  REQUIRE(handle != nullptr);
+  CHECK(::dlsym(handle, "InitializeInjectionNvtx2") ==
+        reinterpret_cast<void*>(&InitializeInjectionNvtx2));
+  CHECK(::dlclose(handle) == 0);
+}
+
+TEST_CASE("telemetry_context without a memory manager uses the fallback GPU group",
+          "[telemetry_context]")
+{
+  const auto out_dir = std::filesystem::temp_directory_path() /
+                       ("sirius_telemetry_nomgr_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(out_dir);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = out_dir.string();
+  config.engine_name      = "test-engine";
+
+  std::string worker_id, fallback_id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config, nullptr);
+    REQUIRE(context->get_memory_context() != nullptr);
+    const auto& gpu0 = context->gpu_device_telemetry_handles(0);
+    // No manager means no declared devices: every ordinal resolves to the one fallback group.
+    REQUIRE(gpu0.device.id() == context->gpu_device_telemetry_handles(1).device.id());
+    worker_id   = uuid_str(context->worker_id().raw());
+    fallback_id = uuid_str(gpu0.device.id().raw());
+  }
+  const auto lines = read_all_telemetry_lines(out_dir);
+  REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-fallback\"", worker_id, fallback_id}));
+  std::filesystem::remove_all(out_dir);
+}
+
+TEST_CASE("telemetry_context nests threads under per-GPU device groups",
+          "[telemetry_context][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager       = initialize_memory_manager(2);
+  const auto out_dir = std::filesystem::temp_directory_path() /
+                       ("sirius_telemetry_test_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(out_dir);
+
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = out_dir.string();
+  config.engine_name      = "test-engine";
+
+  std::string worker_id;
+  std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id;
+  {
+    auto context =
+      telemetry_context::create(std::move(make_quent_context(config)), config, manager.get());
+    const auto& gpu0 = context->gpu_device_telemetry_handles(0);
+    worker_id        = uuid_str(context->worker_id().raw());
+    gpu0_id          = uuid_str(gpu0.device.id().raw());
+    gpu1_id          = uuid_str(context->gpu_device_telemetry_handles(1).device.id().raw());
+    gpu0_exec_id     = uuid_str(gpu0.executor_threads.id().raw());
+    gpu0_mgr_id      = uuid_str(gpu0.manager_threads.id().raw());
+
+    // Every declared resource has its own id.
+    const std::vector<std::string> ids{worker_id, gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id};
+    for (size_t i = 0; i < ids.size(); i++) {
+      for (size_t j = i + 1; j < ids.size(); j++) {
+        REQUIRE(ids[i] != ids[j]);
+      }
+    }
+
+    // Unknown devices reuse one fallback group.
+    const auto& fallback = context->gpu_device_telemetry_handles(99);
+    REQUIRE(fallback.device.id() == context->gpu_device_telemetry_handles(99).device.id());
+    REQUIRE(fallback.device.id() != gpu0.device.id());
+
+    // Emit the same resource references as the GPU executor.
+    auto exec_thread = context->context().executor_thread_observer()->handle();
+    exec_thread.spawned({.label = "test-gpu0-exec-0", .group_id = gpu0.executor_threads.id()});
+    auto manager_thread = context->context().task_manager_loop_thread_observer()->handle();
+    manager_thread.spawned({.label = "gpu-0-exec-manager", .group_id = gpu0.manager_threads.id()});
+    auto task_queue = context->context().task_queue_observer()->handle();
+    task_queue.created({.worker_id     = context->worker_id(),
+                        .gpu_device_id = gpu0.device.id(),
+                        .label         = "gpu_pipeline-task-queue"});
+
+  }  // The context flushes the ndjson files.
+
+  const auto lines = read_all_telemetry_lines(out_dir);
+  REQUIRE(!lines.empty());
+
+  // Device groups are declared under the worker, with matching ids.
+  REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", worker_id, gpu0_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-1\"", worker_id, gpu1_id}));
+  // Thread groups are declared under the gpu-0 device group or worker.
+  REQUIRE(any_line_with_all(lines, {"gpu-0-executor-threads", gpu0_id, gpu0_exec_id}));
+  REQUIRE(any_line_with_all(lines, {"gpu-0-manager-threads", gpu0_id, gpu0_mgr_id}));
+  REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
+  // Threads and queues point at their declared GPU resources.
+  REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", gpu0_exec_id}));
+  REQUIRE(any_line_with_all(lines, {"gpu-0-exec-manager", gpu0_mgr_id}));
+  REQUIRE(any_line_with_all(lines, {"gpu_pipeline-task-queue", gpu0_id}));
+
+  std::filesystem::remove_all(out_dir);
+}

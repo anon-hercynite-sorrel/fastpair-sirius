@@ -1,0 +1,317 @@
+# Task Creator
+
+This document covers the task creation subsystem: how the system decides when and what tasks to create based on operator readiness and data availability.
+
+## Overview
+
+**File:** `src/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
+
+The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
+
+Task creation policy is internal and currently demand-driven, with source-side
+pipelines prioritized first within each branch. The engine retains its
+lookahead and reverse-priority primitives for policy-controlled use, but users
+do not select either through YAML.
+
+## Core Flow
+
+```
+schedule(operator*)
+    ↓
+_task_creation_queue.push(request)
+    ↓
+manager_loop() picks up request
+    ↓
+get_operator_for_next_task(operator) — follows hint chain
+    ↓
+operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
+    ↓
+Create task (gpu_pipeline_task)
+    ↓
+Dispatch to executor (task_scheduler)
+```
+
+## Per-query State
+
+Created for each query at execution-window begin, filled during `prepare_for_query()`, and removed by `reset(query_id)`:
+
+| Map | Key | Value | Purpose |
+|-----|-----|-------|---------|
+| `_query_task_global_states` | query ID | `query_task_global_state` | Completion handler, per-operator pipeline states, and look-ahead queue for one query |
+
+The registry is protected by `_global_state_mutex`. Each query's pipeline-state map is filled before its task-creation workers read it.
+
+## `TaskCreationHint` Enum
+
+**File:** `src/op/sirius_physical_operator.hpp`
+
+```cpp
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+struct task_creation_hint {
+    TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+    sirius_physical_operator* producer{nullptr};
+};
+```
+
+- `READY` — operator has sufficient input data, create a task now
+- `WAITING_FOR_INPUT_DATA` — follow `producer` pointer to find upstream operator
+
+## `get_operator_for_next_task()` — Recursive Hint Chain
+
+**File:** `src/creator/task_creator.cpp`
+
+```
+function get_operator_for_next_task(node):
+    hint = node->get_next_task_hint()
+    if hint is READY:
+        return hint.producer  // create task from this operator
+    if hint is WAITING_FOR_INPUT_DATA:
+        producer = hint.producer
+        return get_operator_for_next_task(producer)  // recurse upstream
+    if no hint:
+        return nullptr  // nothing to do
+```
+
+This recursion ensures data flows from the deepest producers first, respecting pipeline dependencies.
+
+## Base Class `get_next_task_hint()`
+
+**File:** `src/op/sirius_physical_operator.cpp`
+
+Default implementation checks all input ports in order:
+
+1. If any `FULL` barrier port's source pipeline is not finished → return `WAITING_FOR_INPUT_DATA` pointing to that pipeline's source
+2. If all ports have data available (and FULL barriers have finished source pipelines) → return `READY`
+3. If any `PARTIAL` barrier port's source pipeline is not finished → return `WAITING_FOR_INPUT_DATA`
+4. Otherwise → return `nullopt` (nothing to do)
+
+## Base Class `get_next_task_input_data()`
+
+**File:** `src/op/sirius_physical_operator.cpp`
+
+Default implementation pops one batch from each input port:
+
+```
+for each port (in order):
+    batch = port.repo->pop_data_batch(state=task_created)
+    batches.push_back(batch)
+return operator_data(batches)
+```
+
+Returns `nullptr` if no batches are available.
+
+## Per-Operator Overrides
+
+The core of the task creator's behavior comes from operator-specific overrides:
+
+### HASH_JOIN (BUILD_PROBE mode)
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | Tracks build state machine: `NOT_BUILT` → `SCHEDULING` → `SCHEDULED` → `BUILT`. Returns READY when both build and probe data available (NOT_BUILT) or probe data available (BUILT). |
+| `get_next_task_input_data()` | `get_next_task_input_data_for_build_probe()`: On SCHEDULING → pop one build + one probe batch. On BUILT → pop one probe batch. |
+| Why custom | Build/probe asymmetry: first task needs both sides, subsequent tasks only need probe |
+
+State machine transitions:
+```
+NOT_BUILT: build_size>0 AND probe_size>0 → SCHEDULING (return READY)
+SCHEDULING/SCHEDULED: → WAITING_FOR_INPUT_DATA (probe source)
+BUILT: probe_size>0 → READY
+```
+
+### HASH_JOIN (STANDARD mode)
+
+Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`. Input data walks the partition × left × right grid using snapshot batch IDs for Cartesian product iteration.
+
+### PARTITION
+
+PARTITION receives explicit keys and an ingress barrier from planning. A fixed layout needs no
+consumer policy. For adaptive inputs, both task hints and task creation enter one shared
+`partition_exchange` before claiming data. Nonempty unresolved inputs nominate the sizing input
+for task creation; hints do not select a consumer algorithm. Consumer-specific bindings choose the count,
+routing modes, placement, and any concat-all requirement. The decision is serialized once for all
+bound inputs; the routers do not acquire each other's operator locks.
+
+Hash-join bindings normally size from build; right-family joins size from probe except inside a
+right-delim join. Dense-count bindings wait for both producers before measuring the combined
+input. Grouped-merge bindings may use a projected size. A completed empty sizing input preserves
+the one-partition fallback. After resolution, normal port barriers determine readiness.
+
+The build-input observer certifies dynamic-filter inventory before the first claim, contributes
+before scatter, and publishes after successful scatter. That lifecycle belongs to the hash-join
+binding rather than the router's scheduling policy.
+
+### CONCAT
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If source finished: READY if data exists. If `_concat_all`: WAITING. Otherwise: READY when adding another batch would exceed `_concat_batch_bytes` or the cuDF row-count limit (the overflowing batch seeds the next group); a lone oversized batch is deferred until a second batch arrives or the source finishes. |
+| `get_next_task_input_data()` | Pulls the first partition with a complete group under the same policy as the hint (`plan_pull_for_partition`). Returns `partitioned_operator_data` with partition index. |
+| Why custom | Generic byte-target or complete-partition grouping, configured by the consumer wiring |
+
+CONCAT accepts a `concat_all` flag, specifying whether each partition must
+be fully concatenated. If `concat_all` is true it waits for producer
+completion, claims each nonempty partition under its operator mutex, and
+publishes one batch at that original index. It forwards singletons and
+concatenates fragmented partitions in repository traversal order; this does
+not establish SQL ordering across concurrent producers. Empty partitions
+emit nothing. Group selection uses available row-count metadata to reject
+an oversized complete partition before claiming or uploading input, or to
+split bounded groups. Claiming transfers ownership into ordinary
+`partitioned_operator_data`; standard preparation handles transfers and
+decoding. Execution validates the actual GPU tables for row-count overflow
+and a common memory space before forwarding or concatenating them.
+Allocation failures use the executor's normal OOM handling and bounded
+retry path; CONCAT has no separate target-capacity precheck.
+
+Join wrapping selects the initial flag from join semantics. Its explicit input binding keeps
+the build CONCAT reference and configures runtime BUILD_PROBE or whole-build dynamic-filter
+folding inside the shared exchange decision, before either router can claim input. The routers
+carry no build/probe roles or CONCAT references. The converter preserves build-first dependencies. A later change to the
+CONCAT flag after its first successful claim throws, since already emitted partial groups cannot
+be combined retroactively. Normal producer completion and task retirement govern readiness;
+there is no separate repository completion protocol.
+
+### SORT_SAMPLE
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If boundaries computed: base class. Otherwise: waits for N sample batches OR source finished. |
+| `get_next_task_input_data()` | Base class (after boundary computation) |
+| Why custom | Two-phase: cannot compute boundaries until N samples are collected |
+
+### MERGE_SORT
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | Base class (no override) |
+| `get_next_task_input_data()` | Mutex-locked: drains ALL batches from one partition, advances `_current_partition_index`. |
+| Why custom | One task per partition — must drain entire partition for multi-way merge |
+
+### MERGE_AGGREGATE
+
+The ungrouped aggregate merge waits for its upstream producer to finish and claims one task, regardless of whether partial-result batches exist. It drains all partials for a normal merge, or returns `input_free_operator_data` to construct the final empty-input row. Its `all_ports_empty()` override remains false until this descriptor is handed out, preventing a zero-batch input from finishing the pipeline before finalization. The existing pipeline task-creation lock covers handout and incrementing the task count.
+
+### GROUPED_AGGREGATE_MERGE
+
+Same pattern as MERGE_SORT: drains all batches from one partition per call, advancing partition index.
+
+### TOP_N_MERGE
+
+Same pattern as MERGE_SORT: drains all batches from one partition per call.
+
+### DELIM_JOIN
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_input_data()` | Delegates to internal `partition_join` operator |
+| Why custom | Wrapper pattern — the actual task creation is handled by the embedded join |
+
+## Override Summary Table
+
+| Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
+|----------|------------------------|------------------------------|------------|
+| HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
+| HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
+| PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
+| CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
+| SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
+| MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
+| GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |
+| TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
+| DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
+
+## Task Creator Manager Loop
+
+**File:** `src/creator/task_creator.cpp`
+
+### Scan Scheduling Strategy
+
+At query startup, exactly one scan is scheduled (`start_query()` schedules `scans.front()`). Every other scan is activated by the `get_next_task_hint()` topology-driven hint chain — avoiding excessive memory consumption from eagerly scanning all tables — or, under the `lookahead` strategy, by `schedule_lookahead()` when the task queue runs empty (see below).
+
+```
+while running:
+    1. thread_pool.reserve()              -- wait for thread availability (bounded_thread_pool slot)
+    2. _task_creation_queue.pop()         -- get next scheduling request
+    3. node = get_operator_for_next_task(request.node)  -- follow hint chain
+    4. if node is nullptr: re-evaluate the visited pipelines' status
+       (update_pipeline_status(false), deduped per request) and continue
+
+    5. Schedule work on the thread pool. Every source — a GPU_SCAN scan or any
+       GPU operator with buffered input — drives the same loop:
+           - Loop while (!node.all_ports_empty()):
+             - Acquire the pipeline's task_creation_guard
+             - data = node.get_next_task_input_data()  // may wait for source input
+             - If no data: leave the loop; the scoped guard releases automatically
+             - Otherwise construct gpu_pipeline_task, which calls mark_task_created()
+             - Release the guard, then dispatch to task_scheduler
+             - If the request was a look-ahead: break after one task
+           - Recheck pipeline status with update_pipeline_status(false)
+```
+
+The creation guard serializes input claims with a separate mutex. It marks creation active under the pipeline status mutex, then releases that mutex before reading input. Existing tasks can therefore complete while a source waits. Status checks defer finalization until the guard releases, protecting the gap between taking the last input and registering its task.
+
+Releasing the guard does not recheck status. Every normal exit from the creation loop must call `update_pipeline_status(false)`, including an empty input or exhausted source. This rechecks deferred completion and schedules downstream consumers when the pipeline closes. Exceptions release the guard and fail the query through the creator's error handler.
+
+### Look-ahead task creation
+
+**Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
+
+The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds that query's `lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the query's queue, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is released by `reset(query_id)` after the runtime owner retires the query, so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
+
+## Device Assignment for GPU Tasks
+
+**File:** `src/creator/task_creator.cpp`
+
+When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `preferred_device_id` (which GPU executor the scheduler should route it to). The choice is resolved in priority order: a device stamped on the input by its producer (a scan split's assigned GPU, or a partition's device), then data-locality by input bytes, then NUMA-affinity. Cached-scan inputs (a resident `scan_operator_input`, which is not a `pipelineable_operator_data`) are handled separately: a GPU-tier cached chunk pins to its own device, and a HOST-tier pinned chunk routes to a NUMA-local GPU via the topology index. The full locality math lives in [`multi-gpu-architecture.md`](multi-gpu-architecture.md); the partition pin is summarized here because it is a correctness requirement.
+
+### Partition device pin
+
+Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators above — build a per-partition cuco hash table that is valid only on the GPU it was built on. Touching it from a stream bound to another device trips `cudaErrorInvalidValue`. So every task of a partition must run on one fixed device.
+
+The task creator does not choose that device. The partition's consumer chooses a `partition_placement` (one device per partition) together with the partition count, `partition_exchange` installs it on each bound PARTITION, which hands it to every operator that emits that exchange's partitions, and the emitter stamps the partition's device on the `partitioned_operator_data` it creates. The task creator reads it back through `get_preferred_device_id()` like a scan split's device. The default policy is round-robin, partition `p` on `active_gpu_ids[p % n]`, which keeps every task of a pinned partition (build + all probes) on one GPU while spreading partitions across GPUs; see [multi-gpu-architecture.md](multi-gpu-architecture.md) for the broadcast and single-partition cases. Partitioned data with no index, or with an unpinned placement, carries no stamp and is placed by locality. Nested-loop joins and single-partition STANDARD hash joins, grouped-aggregate merges, dense-count joins, and empty-build fallbacks use unpinned placement; BUILD_PROBE joins retain a fixed GPU even with one partition.
+
+Placements are drawn from the query's admitted set: `sirius_engine::initialize_internal` computes the admitted subset, installs it on the task creator via `set_active_gpu_ids()`, and builds `pipeline_build_context` from the same list, which the pipeline converter hands to every partition consumer. Consumer input policy rejects a placement that names a device outside it. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
+
+The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state. The clamp applies to stamped preferences too, as a backstop.
+
+A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over `_active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
+
+The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
+
+## `can_create_more_tasks()` and `has_processed_all_tasks()`
+
+These methods signal task exhaustion:
+- `can_create_more_tasks()` — returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed)
+- `has_processed_all_tasks()` — returns false when tasks are still in flight
+
+Both throw `not implemented` in the base class and must be overridden by operators that need them.
+
+## Query retirement
+
+**File:** `src/creator/task_creator.cpp`
+
+After publication settles, `discard_pending_tasks(query_id)` removes the query's queued creation
+requests and queued pool callables. It does not wait or release lookahead state. Manager-held
+requests and running callables retain their work leases through their last resource access.
+
+`SiriusContext::retire_query_work()` waits for those leases before `reset(query_id)` releases the
+query's creator state, including its lookahead queue. Other queries keep using the shared queue.
+See [Query lifetime and retirement](query-lifecycle.md) for the full sequence.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/creator/task_creator.hpp` | Task creator interface |
+| `src/creator/config.hpp` | `task_creator_config`, `request_type` (`active` / `lookahead`) |
+| `src/creator/task_creator.cpp` | Manager loop, hint chain, look-ahead queue, task dispatch |
+| `src/op/sirius_physical_operator.hpp` | Base `get_next_task_hint()`, `get_next_task_input_data()` |
+| `src/op/sirius_physical_operator.cpp` | Base implementations |
+| `src/op/sirius_physical_hash_join.cpp` | BUILD_PROBE hint/data overrides |
+| `src/op/sirius_physical_partition.cpp` | Sibling sync, adaptive count |
+| `src/op/sirius_physical_concat.cpp` | Byte-threshold batching |
+| `src/op/sirius_physical_sort_sample.cpp` | N-batch sampling |
+| `src/op/sirius_physical_merge_sort.cpp` | Per-partition drain |
